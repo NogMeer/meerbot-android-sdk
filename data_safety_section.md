@@ -18,14 +18,16 @@
 
 ## Можно ли запросить удаление данных
 ✅ Да — пользователь может запросить удаление через `MeerBot.reset()` (локальные данные)
-и через `POST /api/v1/widget/visitor/forget` (серверные данные, GDPR Art. 17).
+и через support@meerbot.ru (серверные данные, GDPR Art. 17).
 
 ## Tracking
 ❌ MeerBot SDK НЕ собирает Advertising ID и не передаёт данные в третьи стороны для рекламы.
 
 ## Соответствие
-- **GDPR**: Art. 15 (Right to Access — `POST /api/v1/widget/visitor/data`),
-  Art. 17 (Right to Erasure — `POST /api/v1/widget/visitor/forget`)
+- **GDPR**: Art. 15 (Right to Access) и Art. 17 (Right to Erasure) — для mobile-канала
+  запрос обрабатывается через support@meerbot.ru. Эндпоинты `POST /api/v1/widget/visitor/data`
+  и `/forget` — web-only (требуют widget session JWT; mobile-JWT из `/api/v1/mobile/register`
+  подписан в другом id-пространстве, `aud = ClientMobileApp.id` → `401 widget_mismatch`).
 - **152-ФЗ (РФ)**: Согласие на обработку получается через UI хост-приложения.
 - **Apple App Tracking Transparency**: Не применимо (SDK не использует IDFA).
 - **Google Play Families Policy**: SDK подходит для приложений без ограничений по возрасту
