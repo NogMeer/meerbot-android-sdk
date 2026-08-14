@@ -8,13 +8,18 @@
 | Категория | Тип | Собирается? | Linked? | Цель |
 |---|---|---|---|---|
 | Personal info | User IDs (visitorUuid) | ✅ | ❌ (анонимный UUID) | Поддержка приложения |
-| Personal info | External user ID (если задан клиентом) | ✅ опционально | ✅ | Поддержка приложения |
+| Personal info | External user ID (verified identity) | ❌ пока не поддержан SDK | — | — |
 | Messages | Тексты сообщений | ✅ | ❌ | Поддержка приложения |
 | App activity | Push token (FCM) | ✅ | ❌ | Связь с приложением |
 | Device or other IDs | Device token (FCM) | ✅ | ❌ | Связь с приложением |
 
 ## Шифрование при передаче
-✅ Да — все запросы через HTTPS с certificate pinning (если включён владельцем приложения).
+✅ Да — все запросы идут по HTTPS. Certificate pinning в SDK **не реализован** (см. README,
+«Границы текущей версии»); заявлять его в Play Console нельзя.
+
+## Хранение на устройстве
+`visitorUuid` лежит в `EncryptedSharedPreferences`; JWT в постоянное хранилище не пишется —
+живёт только в памяти процесса.
 
 ## Можно ли запросить удаление данных
 ✅ Да — пользователь может запросить удаление через `MeerBot.reset()` (локальные данные)
