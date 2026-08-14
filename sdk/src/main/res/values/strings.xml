@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Строки SDK. Дефолтная локаль — русская (основной рынок платформы), английская лежит
+  в values-en. Приложение-интегратор может переопределить любую строку, объявив ресурс
+  с тем же именем: префикс meerbot_ защищает от случайных совпадений.
+-->
+<resources>
+    <string name="meerbot_chat_title">Поддержка</string>
+    <string name="meerbot_close">Закрыть чат</string>
+    <string name="meerbot_send">Отправить</string>
+    <string name="meerbot_input_hint">Сообщение…</string>
+    <string name="meerbot_input_hint_closed">Диалог закрыт</string>
+    <string name="meerbot_empty_greeting">Привет! Чем могу помочь?</string>
+    <string name="meerbot_connecting">Подключаемся…</string>
+    <string name="meerbot_typing">%1$s печатает…</string>
+    <string name="meerbot_retry">Повторить</string>
+    <string name="meerbot_not_delivered">Не отправлено</string>
+    <string name="meerbot_messages_list">Сообщения чата</string>
+    <string name="meerbot_message_from_you">Ваше сообщение</string>
+    <string name="meerbot_message_from_bot">Сообщение поддержки</string>
+    <string name="meerbot_err_not_configured">Чат не настроен. Вызовите MeerBot.configure(context, apiKey).</string>
+    <string name="meerbot_err_key_invalid">Неверный ключ или домен приложения не разрешён в кабинете.</string>
+    <string name="meerbot_err_channel_off">Канал отключён в кабинете.</string>
+    <string name="meerbot_err_quota">Дневной лимит расходов исчерпан.</string>
+    <string name="meerbot_err_conv_cap">Месячный лимит диалогов исчерпан.</string>
+    <string name="meerbot_err_rate_limited">Слишком много сообщений. Попробуйте через минуту.</string>
+    <string name="meerbot_err_session_expired">Сессия истекла. Переподключаемся…</string>
+    <string name="meerbot_err_server">Сервер недоступен. Попробуйте ещё раз.</string>
+    <string name="meerbot_err_network">Нет связи с сервером. Проверьте интернет и повторите.</string>
+    <string name="meerbot_err_ai_unavailable">ИИ временно недоступен. Попробуйте ещё раз.</string>
+    <string name="meerbot_err_stream_broken">Соединение прервано. Попробуйте ещё раз.</string>
+    <string name="meerbot_err_invalid_response">Неожиданный ответ сервера.</string>
+    <string name="meerbot_err_cancelled">Отменено.</string>
+
+    <string name="meerbot_not_configured_title">MeerBot не настроен</string>
+    <string name="meerbot_not_configured_body">Вызовите MeerBot.configure(context, apiKey) при старте приложения.</string>
+</resources>

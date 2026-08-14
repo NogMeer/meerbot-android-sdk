@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="meerbot_chat_title">Support</string>
+    <string name="meerbot_close">Close chat</string>
+    <string name="meerbot_send">Send</string>
+    <string name="meerbot_input_hint">Message…</string>
+    <string name="meerbot_input_hint_closed">Conversation closed</string>
+    <string name="meerbot_empty_greeting">Hi! How can we help?</string>
+    <string name="meerbot_connecting">Connecting…</string>
+    <string name="meerbot_typing">%1$s is typing…</string>
+    <string name="meerbot_retry">Retry</string>
+    <string name="meerbot_not_delivered">Not delivered</string>
+    <string name="meerbot_messages_list">Chat messages</string>
+    <string name="meerbot_message_from_you">Your message</string>
+    <string name="meerbot_message_from_bot">Support message</string>
+    <string name="meerbot_err_not_configured">Chat is not configured. Call MeerBot.configure(context, apiKey).</string>
+    <string name="meerbot_err_key_invalid">Invalid key, or the app domain is not allowed in the dashboard.</string>
+    <string name="meerbot_err_channel_off">The channel is disabled in the dashboard.</string>
+    <string name="meerbot_err_quota">Daily spending limit reached.</string>
+    <string name="meerbot_err_conv_cap">Monthly conversation limit reached.</string>
+    <string name="meerbot_err_rate_limited">Too many messages. Try again in a minute.</string>
+    <string name="meerbot_err_session_expired">Session expired. Reconnecting…</string>
+    <string name="meerbot_err_server">Server is unavailable. Please try again.</string>
+    <string name="meerbot_err_network">No connection to the server. Check the internet and retry.</string>
+    <string name="meerbot_err_ai_unavailable">AI is temporarily unavailable. Please try again.</string>
+    <string name="meerbot_err_stream_broken">Connection interrupted. Please try again.</string>
+    <string name="meerbot_err_invalid_response">Unexpected server response.</string>
+    <string name="meerbot_err_cancelled">Cancelled.</string>
+
+    <string name="meerbot_not_configured_title">MeerBot is not configured</string>
+    <string name="meerbot_not_configured_body">Call MeerBot.configure(context, apiKey) on app start.</string>
+</resources>
