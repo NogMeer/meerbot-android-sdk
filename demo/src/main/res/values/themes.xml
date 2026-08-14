@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Тему рисует Compose; системная нужна только ради фона окна и статус-бара.
+         Тёмный вариант — в values-night. -->
+    <style name="Theme.MeerBotDemo" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>
