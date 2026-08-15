@@ -36,11 +36,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.lifecycle.viewmodel.compose.viewModel
 import ru.meerbot.sdk.R
+import ru.meerbot.sdk.state.ChatController
 import ru.meerbot.sdk.state.ChatMessage
 import ru.meerbot.sdk.state.ChatMode
-import ru.meerbot.sdk.state.ChatViewModel
 
 /**
  * Экран чата. Контракт совпадает с iOS ChatView.
@@ -50,20 +49,20 @@ import ru.meerbot.sdk.state.ChatViewModel
  */
 @Composable
 fun ChatScreen(
+    controller: ChatController,
     modifier: Modifier = Modifier,
     title: String? = null,
     primaryColor: Color? = null,
     onClose: (() -> Unit)? = null,
-    viewModel: ChatViewModel = viewModel(),
 ) {
-    val state by viewModel.state.collectAsState()
+    val state by controller.state.collectAsState()
     val listState = rememberLazyListState()
     val accent = primaryColor ?: MaterialTheme.colorScheme.primary
     val listDescription = stringResource(R.string.meerbot_messages_list)
 
     // Handshake — на первом показе экрана, а не на старте приложения: иначе визитор
     // записывался бы каждому, кто чат ни разу не открыл.
-    LaunchedEffect(Unit) { viewModel.start() }
+    LaunchedEffect(controller) { controller.start() }
 
     LaunchedEffect(state.messages.size, state.messages.lastOrNull()?.content) {
         if (state.messages.isNotEmpty()) {
@@ -119,7 +118,7 @@ fun ChatScreen(
         state.connectionError?.let { error ->
             ConnectionBanner(
                 text = stringResource(error.messageRes),
-                onRetry = if (state.retryable != null) viewModel::retry else null,
+                onRetry = if (state.retryable != null) controller::retry else null,
             )
         }
 
@@ -128,8 +127,8 @@ fun ChatScreen(
             sending = state.sending,
             closed = state.mode == ChatMode.Closed,
             accent = accent,
-            onDraftChange = viewModel::setDraft,
-            onSend = viewModel::send,
+            onDraftChange = controller::setDraft,
+            onSend = controller::send,
         )
     }
 }

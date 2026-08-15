@@ -9,7 +9,6 @@
 -keep public class ru.meerbot.sdk.network.MeerBotError { public *; }
 -keep public class ru.meerbot.sdk.network.MeerBotError$* { public *; }
 -keep public class ru.meerbot.sdk.state.ChatController { public *; }
--keep public class ru.meerbot.sdk.state.ChatViewModel { public *; }
 -keep public class ru.meerbot.sdk.state.ChatMessage { public *; }
 -keep public class ru.meerbot.sdk.state.ChatState { public *; }
 -keep public enum ru.meerbot.sdk.state.ChatMode { *; }

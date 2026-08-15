@@ -126,11 +126,14 @@ object MeerBot {
         primaryColor: Color? = null,
         onClose: (() -> Unit)? = null,
     ) {
+        // Контроллер читается на каждой композиции: повторный configure(...) (например,
+        // смена ключа) должен подхватываться сразу, а не после перезапуска процесса.
         val current = controller
         if (current == null) {
             NotConfiguredScreen(modifier)
         } else {
             ChatScreenImpl(
+                controller = current,
                 modifier = modifier,
                 title = title,
                 primaryColor = primaryColor,

@@ -67,7 +67,6 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-core")
     implementation("androidx.activity:activity-compose:1.8.2")
-    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0")
 
     // Корутины объявлены явно: раньше проект держался на транзитиве от lifecycle —
     // обновление lifecycle молча меняло бы версию корутин под сетевым слоем.

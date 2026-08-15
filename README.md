@@ -185,7 +185,6 @@ sdk/src/main/kotlin/ru/meerbot/sdk/
   network/MeerBotError.kt           коды ошибок платформы и тексты для пользователя
   state/ChatController.kt           поведение: отправка, обрыв, повтор, догон истории
   state/ChatStore.kt                наблюдаемое состояние экрана
-  state/ChatViewModel.kt            тонкая обёртка для Compose
   ui/                               Compose: ChatScreen, NotConfiguredScreen
 demo/                               демо-приложение (аналог Example у iOS)
 ```

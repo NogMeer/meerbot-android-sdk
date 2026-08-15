@@ -28,7 +28,6 @@ import ru.meerbot.sdk.R
 import ru.meerbot.sdk.network.ApiClient
 import ru.meerbot.sdk.network.MeerBotConfiguration
 import ru.meerbot.sdk.state.ChatController
-import ru.meerbot.sdk.state.ChatViewModel
 
 /**
  * Экран против настоящего состояния и настоящего (замоканного) сервера.
@@ -94,7 +93,7 @@ class ChatScreenTest {
         )
         compose.setContent {
             MaterialTheme {
-                ChatScreen(viewModel = ChatViewModel { controller })
+                ChatScreen(controller = controller)
             }
         }
     }
