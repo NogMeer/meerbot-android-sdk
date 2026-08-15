@@ -61,8 +61,7 @@ private fun DemoApp() {
     val prefs = remember { context.getSharedPreferences("meerbot_demo", Context.MODE_PRIVATE) }
 
     var apiKey by rememberSaveable { mutableStateOf(prefs.getString("apiKey", "").orEmpty()) }
-    var pushApiKey by rememberSaveable { mutableStateOf(prefs.getString("pushApiKey", "").orEmpty()) }
-    var origin by rememberSaveable { mutableStateOf(prefs.getString("origin", "https://meerbot.ru").orEmpty()) }
+    var identityToken by rememberSaveable { mutableStateOf(prefs.getString("identityToken", "").orEmpty()) }
     var baseUrl by rememberSaveable {
         mutableStateOf(prefs.getString("baseUrl", MeerBotConfiguration.DEFAULT_BASE_URL).orEmpty())
     }
@@ -82,8 +81,8 @@ private fun DemoApp() {
     ) {
         Text("MeerBot SDK ${MeerBot.VERSION}", style = MaterialTheme.typography.titleLarge)
         Text(
-            "Ключ виджета — из кабинета: Бот → Каналы → headless-виджет. " +
-                "Origin обязан быть в списке разрешённых доменов этого ключа.",
+            "Ключ мобильного приложения — из кабинета: Бот → Каналы → Мобильные приложения. " +
+                "Ключ ровно один: у канала свои эндпоинты, разрешённые домены к нему не относятся.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -91,25 +90,17 @@ private fun DemoApp() {
         OutlinedTextField(
             value = apiKey,
             onValueChange = { apiKey = it },
-            label = { Text("apiKey (pk_live_… виджета)") },
+            label = { Text("apiKey (pk_live_… приложения)") },
             singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
             modifier = Modifier.fillMaxWidth(),
         )
         OutlinedTextField(
-            value = pushApiKey,
-            onValueChange = { pushApiKey = it },
-            label = { Text("pushApiKey (необязательно)") },
+            value = identityToken,
+            onValueChange = { identityToken = it },
+            label = { Text("identityToken (необязательно)") },
             singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
-            modifier = Modifier.fillMaxWidth(),
-        )
-        OutlinedTextField(
-            value = origin,
-            onValueChange = { origin = it },
-            label = { Text("Origin") },
-            singleLine = true,
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
             modifier = Modifier.fillMaxWidth(),
         )
         OutlinedTextField(
@@ -127,17 +118,15 @@ private fun DemoApp() {
             onClick = {
                 prefs.edit()
                     .putString("apiKey", apiKey.trim())
-                    .putString("pushApiKey", pushApiKey.trim())
-                    .putString("origin", origin.trim())
+                    .putString("identityToken", identityToken.trim())
                     .putString("baseUrl", baseUrl.trim())
                     .apply()
                 MeerBot.configure(
                     context = context,
                     apiKey = apiKey.trim(),
-                    pushApiKey = pushApiKey.trim().takeIf { it.isNotEmpty() },
-                    origin = origin.trim().takeIf { it.isNotEmpty() },
                     baseUrl = baseUrl.trim(),
                 )
+                MeerBot.identify(identityToken.trim().takeIf { it.isNotEmpty() })
                 chatOpen = true
             },
             enabled = apiKey.isNotBlank(),
@@ -151,7 +140,7 @@ private fun DemoApp() {
                 MeerBot.reset()
                 prefs.edit().clear().apply()
                 apiKey = ""
-                pushApiKey = ""
+                identityToken = ""
             },
             modifier = Modifier.fillMaxWidth(),
         ) {

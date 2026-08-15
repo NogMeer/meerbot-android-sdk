@@ -64,15 +64,13 @@ class ChatScreenTest {
         server.shutdown()
     }
 
-    private fun session(greeting: String? = null, mode: String = "ai") =
-        MockResponse().setResponseCode(201).setBody(
-            buildString {
-                append("""{"jwt":"jwt-1","expiresIn":900,"mode":"$mode"""")
-                append(""","widget":{"title":"Поддержка"""")
-                if (greeting != null) append(""","greeting":"$greeting"""")
-                append("}}")
-            }
-        )
+    private fun register() = MockResponse().setBody(
+        """{"deviceId":"42","jwt":"jwt-1","expiresIn":900,"identity":{"status":"not_provided"}}"""
+    )
+
+    private fun history(mode: String = "ai", messages: String = "") = MockResponse().setBody(
+        """{"messages":[$messages],"hasMore":false,"mode":"$mode"}"""
+    )
 
     private fun sse(body: String) = MockResponse()
         .setHeader("Content-Type", "text/event-stream")
@@ -82,12 +80,12 @@ class ChatScreenTest {
         val controller = ChatController(
             client = ApiClient(
                 config = MeerBotConfiguration(
-                    apiKey = "pk_live_widget",
+                    apiKey = "pk_live_mobile",
                     baseUrl = server.url("/").toString().trimEnd('/'),
-                    origin = "https://ru.meerbot.demo",
-                    sdkVersion = "0.1.0-test",
+                    sdkVersion = "0.2.0-test",
                 ),
                 visitorUuid = "11111111-1111-1111-1111-111111111111",
+                installationId = "and-22222222-2222-2222-2222-222222222222",
             ),
             scope = scope,
         )
@@ -99,18 +97,22 @@ class ChatScreenTest {
     }
 
     @Test
-    fun приветствие_канала_показывается_в_пустой_ленте() {
-        server.enqueue(session(greeting = "Чем можем помочь?"))
+    fun прошлая_переписка_подтягивается_при_открытии() {
+        server.enqueue(register())
+        server.enqueue(
+            history(messages = """{"id":7,"role":"assistant","content":"мы на связи","createdAt":"2026-08-14T10:00:00.000Z"}""")
+        )
 
         showScreen()
 
-        compose.awaitText("Чем можем помочь?")
-        compose.onNodeWithText("Чем можем помочь?").assertIsDisplayed()
+        compose.awaitText("мы на связи")
+        compose.onNodeWithText("мы на связи", substring = true).assertIsDisplayed()
     }
 
     @Test
     fun отправка_добавляет_сообщение_и_стримит_ответ() {
-        server.enqueue(session())
+        server.enqueue(register())
+        server.enqueue(history())
         server.enqueue(
             sse(
                 "event: meta\ndata: {\"conversationId\":3,\"mode\":\"ai\"}\n\n" +
@@ -131,11 +133,13 @@ class ChatScreenTest {
 
     @Test
     fun обрыв_показывает_повтор_и_метку_недоставленного() {
-        server.enqueue(session())
+        server.enqueue(register())
+        server.enqueue(history())
         server.enqueue(
             sse("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n")
                 .setSocketPolicy(SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY)
         )
+        server.enqueue(history())
 
         showScreen()
         compose.waitForIdle()
@@ -149,7 +153,8 @@ class ChatScreenTest {
 
     @Test
     fun закрытый_диалог_блокирует_ввод() {
-        server.enqueue(session(mode = "closed"))
+        server.enqueue(register())
+        server.enqueue(history(mode = "closed"))
 
         showScreen()
 

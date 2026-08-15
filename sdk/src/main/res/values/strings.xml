@@ -21,7 +21,7 @@
     <string name="meerbot_err_not_configured">Чат не настроен. Вызовите MeerBot.configure(context, apiKey).</string>
     <string name="meerbot_err_key_invalid">Неверный ключ или домен приложения не разрешён в кабинете.</string>
     <string name="meerbot_err_channel_off">Канал отключён в кабинете.</string>
-    <string name="meerbot_err_quota">Дневной лимит расходов исчерпан.</string>
+    <string name="meerbot_err_quota">Чат временно недоступен. Попробуйте позже.</string>
     <string name="meerbot_err_conv_cap">Месячный лимит диалогов исчерпан.</string>
     <string name="meerbot_err_rate_limited">Слишком много сообщений. Попробуйте через минуту.</string>
     <string name="meerbot_err_session_expired">Сессия истекла. Переподключаемся…</string>
@@ -29,6 +29,8 @@
     <string name="meerbot_err_network">Нет связи с сервером. Проверьте интернет и повторите.</string>
     <string name="meerbot_err_ai_unavailable">ИИ временно недоступен. Попробуйте ещё раз.</string>
     <string name="meerbot_err_stream_broken">Соединение прервано. Попробуйте ещё раз.</string>
+    <string name="meerbot_err_message_too_long">Сообщение слишком длинное.</string>
+    <string name="meerbot_err_identity_required">Чат доступен после входа в приложение.</string>
     <string name="meerbot_err_invalid_response">Неожиданный ответ сервера.</string>
     <string name="meerbot_err_cancelled">Отменено.</string>
 

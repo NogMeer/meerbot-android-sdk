@@ -16,7 +16,7 @@
     <string name="meerbot_err_not_configured">Chat is not configured. Call MeerBot.configure(context, apiKey).</string>
     <string name="meerbot_err_key_invalid">Invalid key, or the app domain is not allowed in the dashboard.</string>
     <string name="meerbot_err_channel_off">The channel is disabled in the dashboard.</string>
-    <string name="meerbot_err_quota">Daily spending limit reached.</string>
+    <string name="meerbot_err_quota">The chat is temporarily unavailable. Try again later.</string>
     <string name="meerbot_err_conv_cap">Monthly conversation limit reached.</string>
     <string name="meerbot_err_rate_limited">Too many messages. Try again in a minute.</string>
     <string name="meerbot_err_session_expired">Session expired. Reconnecting…</string>
@@ -24,6 +24,8 @@
     <string name="meerbot_err_network">No connection to the server. Check the internet and retry.</string>
     <string name="meerbot_err_ai_unavailable">AI is temporarily unavailable. Please try again.</string>
     <string name="meerbot_err_stream_broken">Connection interrupted. Please try again.</string>
+    <string name="meerbot_err_message_too_long">The message is too long.</string>
+    <string name="meerbot_err_identity_required">Sign in to the app to use the chat.</string>
     <string name="meerbot_err_invalid_response">Unexpected server response.</string>
     <string name="meerbot_err_cancelled">Cancelled.</string>
 

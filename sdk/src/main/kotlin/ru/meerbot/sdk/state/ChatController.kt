@@ -38,13 +38,11 @@ class ChatController(
         if (startJob?.isActive == true || store.state.value.ready) return
         startJob = scope.launch {
             try {
-                val session = client.openSession()
-                store.setGreeting(session.greeting)
-                store.setMode(session.mode)
+                client.openSession()
                 store.setError(null)
-                if (session.conversationId != null) {
-                    runCatching { loadHistory() }
-                }
+                // История подтягивается всегда: диалог у канала один на устройство, и после
+                // переустановки экрана лента обязана прийти с сервера, а не остаться пустой.
+                runCatching { loadHistory() }
                 store.setReady(true)
             } catch (e: CancellationException) {
                 throw e
@@ -80,10 +78,16 @@ class ChatController(
         }
     }
 
-    /** Открыть конкретный диалог (deep link из пуша) и подтянуть его историю. */
-    fun openConversation(id: Long) {
+    /**
+     * Привести ленту к серверной: вызывается, когда приложение вернулось на передний план
+     * или получило пуш от своего бэкенда о новом ответе менеджера.
+     *
+     * Выбирать диалог клиенту нечем: у канала он один на устройство, сервер резолвит его
+     * по токену. Раньше здесь был `openConversation(id)` — вместе с виджетным контрактом
+     * ушёл и он.
+     */
+    fun refresh() {
         scope.launch {
-            client.setConversationId(id)
             try {
                 loadHistory()
                 store.setError(null)
@@ -94,6 +98,13 @@ class ChatController(
             }
         }
     }
+
+    /**
+     * Идентификатор диалога — непрозрачен и действителен только в паре с каналом
+     * `mobile_app`. Нужен хост-приложению ровно для одного: не показывать свой пуш о
+     * диалоге, который открыт на экране.
+     */
+    val conversationId: Long? get() = client.conversationId
 
     fun stop() {
         streamJob?.cancel()
@@ -195,15 +206,13 @@ class ChatController(
 
         store.setError(chatError(error))
 
-        // Диалог мог быть уже заведён, а ответ — дописан сервером, пока рвалось соединение.
-        // Серверную ленту принимаем ТОЛЬКО если она заканчивается ответом: иначе замена
-        // выбросила бы из UI недоставленное сообщение пользователя.
-        if (client.conversationId != null) {
-            val items = runCatching { fetchHistory() }.getOrNull()
-            if (items != null && items.lastOrNull()?.role == "assistant") {
-                store.replaceAll(items)
-                return
-            }
+        // Ответ мог быть дописан сервером, пока рвалось соединение. Серверную ленту
+        // принимаем ТОЛЬКО если она заканчивается ответом: иначе замена выбросила бы из UI
+        // недоставленное сообщение пользователя.
+        val items = runCatching { fetchHistory() }.getOrNull()
+        if (items != null && items.lastOrNull()?.role == "assistant") {
+            store.replaceAll(items)
+            return
         }
 
         store.setFailed(userMessageId, true)
@@ -221,14 +230,24 @@ class ChatController(
      * Полный тред диалога с сервера (не инкремент — иначе замена ленты обрезала бы её до
      * пары последних сообщений).
      */
-    private suspend fun fetchHistory(): List<ChatMessage> = client.history().map { item ->
+    private suspend fun fetchHistory(): List<ChatMessage> {
+        val page = client.history()
+        store.setMode(page.mode)
+        return page.messages.map { item ->
         ChatMessage(
             id = "srv-${item.id}",
             role = item.role,
-            author = if (item.role == "assistant") "ai" else null,
+            // Ответ менеджера отличается от ответа ИИ именем автора: канал отдаёт его в
+            // истории, и терять это на догоне нельзя — в ленте появился бы «ИИ», который
+            // на самом деле человек.
+            author = if (item.role == "assistant") {
+                if (item.authorName != null) "manager" else "ai"
+            } else null,
+            authorName = item.authorName,
             content = item.content,
-            timestamp = item.createdAtMs,
-        )
+                timestamp = item.createdAtMs,
+            )
+        }
     }
 
     private fun chatError(error: Throwable): ChatError {

@@ -12,11 +12,10 @@ import androidx.security.crypto.MasterKey
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import ru.meerbot.sdk.network.ApiClient
+import ru.meerbot.sdk.network.IdentityStatus
 import ru.meerbot.sdk.network.MeerBotConfiguration
-import ru.meerbot.sdk.network.MeerBotError
 import ru.meerbot.sdk.state.ChatController
 import ru.meerbot.sdk.ui.NotConfiguredScreen
 import java.util.UUID
@@ -29,10 +28,11 @@ import ru.meerbot.sdk.ui.ChatScreen as ChatScreenImpl
  * ```
  * MeerBot.configure(context, apiKey = "pk_live_…")   // старт приложения
  * MeerBot.ChatScreen()                               // Compose-экран чата
- * MeerBot.setPushToken(fcmToken)                     // если нужны пуши
+ * MeerBot.identify(identityToken)                    // если пользователь вошёл
  * ```
  *
- * Контракт совпадает с iOS SDK (docs/mobile-sdk/api-reference.md).
+ * SDK работает с каналом `mobile_app`: один ключ, свои эндпоинты, свой тред на устройство
+ * (docs/mobile-sdk/android.md).
  */
 @SuppressLint("StaticFieldLeak")
 object MeerBot {
@@ -45,6 +45,7 @@ object MeerBot {
     private const val PREF_NAME = "meerbot_sdk"
     private const val PREF_NAME_ENCRYPTED = "meerbot_sdk_secure"
     private const val KEY_VISITOR_UUID = "visitor_uuid"
+    private const val KEY_INSTALLATION_ID = "installation_id"
     private const val TAG = "MeerBot"
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -55,37 +56,24 @@ object MeerBot {
     private var controller: ChatController? = null
     private var visitorUuid: String? = null
 
-    /** FCM-токен, полученный до configure() — зарегистрируем, как только появится конфигурация. */
-    private var pendingPushToken: String? = null
+    /** Токен идентичности, переданный до configure() — применим на первом рукопожатии. */
+    private var pendingIdentityToken: String? = null
 
     /**
      * Настроить SDK.
      *
-     * @param apiKey `pk_live_*` headless-виджета из кабинета (Бот → Каналы) — транспорт чата.
-     *   Строка `origin` (по умолчанию `https://<applicationId>`) обязана быть в списке
-     *   разрешённых доменов этого ключа, иначе handshake вернёт `key_invalid`.
-     * @param pushApiKey `pk_live_*` мобильного приложения — нужен ТОЛЬКО для пушей: JWT из
-     *   `/mobile/register` чат-эндпоинтом не принимается. Без пушей параметр не нужен.
-     * @param origin переопределение заголовка `Origin`.
+     * @param apiKey `pk_live_*` мобильного приложения из кабинета: Бот → Каналы →
+     *   Мобильные приложения. Ключ ровно один; ключ веб-виджета здесь не подойдёт —
+     *   чат канала отвергнет его токен как `channel_mismatch`.
      * @param baseUrl адрес платформы (для стенда).
      */
     @JvmOverloads
     fun configure(
         context: Context,
         apiKey: String,
-        pushApiKey: String? = null,
-        origin: String? = null,
         baseUrl: String = API_BASE_URL,
     ) {
-        configure(
-            context,
-            MeerBotConfiguration(
-                apiKey = apiKey,
-                pushApiKey = pushApiKey,
-                baseUrl = baseUrl,
-                origin = origin ?: MeerBotConfiguration.defaultOrigin(context),
-            ),
-        )
+        configure(context, MeerBotConfiguration(apiKey = apiKey, baseUrl = baseUrl))
     }
 
     /** Настройка целиком объектом конфигурации (тесты и хост-приложения со своим OkHttp). */
@@ -97,21 +85,26 @@ object MeerBot {
     ) {
         val appContext = context.applicationContext
         prefs = openPrefs(appContext)
-        val uuid = getOrCreateVisitorUuid()
-        val apiClient = ApiClient(configuration, uuid, httpClient)
+        val uuid = getOrCreate(KEY_VISITOR_UUID) { UUID.randomUUID().toString() }
+        // Идентификатор установки уходит в `deviceToken` рукопожатия и определяет, чей это
+        // тред. Он стабилен и не подменяется пуш-токеном: смена значения означала бы для
+        // пользователя новую переписку с нуля.
+        val installation = getOrCreate(KEY_INSTALLATION_ID) { "and-" + UUID.randomUUID() }
+        val apiClient = ApiClient(configuration, uuid, installation, httpClient)
 
         this.configuration = configuration
         this.visitorUuid = uuid
         this.client = apiClient
         this.controller = ChatController(apiClient, scope)
 
-        // Handshake здесь СОЗНАТЕЛЬНО не делаем: `/widget/session` заводит строку визитора,
-        // и рукопожатие на старте приложения записало бы «посетителя» каждому, кто чат ни разу
-        // не открыл, — это перекосило бы аналитику владельца. Кому нужен прогрев — preconnect().
+        // Рукопожатие здесь СОЗНАТЕЛЬНО не делаем: `/mobile/register` заводит строку
+        // устройства, и вызов на старте приложения записал бы «устройство» каждому, кто чат
+        // ни разу не открыл, — это перекосило бы аналитику владельца и его лимиты.
+        // Кому нужен прогрев — preconnect().
 
-        pendingPushToken?.let { token ->
-            pendingPushToken = null
-            setPushToken(token)
+        pendingIdentityToken?.let { token ->
+            pendingIdentityToken = null
+            apiClient.setIdentityToken(token)
         }
     }
 
@@ -154,46 +147,46 @@ object MeerBot {
     }
 
     /**
-     * Зарегистрировать FCM-токен (из `FirebaseMessaging.getInstance().token` или
-     * `onNewToken`). Требует `pushApiKey` в configure; без него вызов игнорируется с записью
-     * в лог. Firebase SDK внутрь библиотеки не тянется — токен приходит уже готовым.
+     * Передать подписанный токен идентичности (verified identity).
+     *
+     * Токен выпускает БЭКЕНД интегратора секретом мобильного приложения (кабинет → Каналы →
+     * Мобильные приложения). Пока он не передан, посетитель анонимен: инструменты с доступом
+     * к данным клиента ему недоступны. Вызов до `configure(...)` запоминается и применяется
+     * на первом рукопожатии.
+     *
+     * `null` — выход пользователя: следующая сессия будет анонимной.
      */
-    fun setPushToken(token: String) {
+    fun identify(identityToken: String?) {
         val apiClient = client
-        val config = configuration
-        if (apiClient == null || config == null) {
-            // configure() ещё не вызван — запомним и зарегистрируем после.
-            pendingPushToken = token
+        if (apiClient == null) {
+            pendingIdentityToken = identityToken
             return
         }
-        if (config.pushApiKey.isNullOrEmpty()) {
-            Log.w(TAG, "setPushToken проигнорирован: не задан pushApiKey в configure(...)")
-            return
-        }
-        scope.launch {
-            try {
-                apiClient.registerDevice(token)
-            } catch (e: MeerBotError) {
-                // Пуши — не критичный путь: чат работает и без них. Но молча не глотаем.
-                Log.w(TAG, "регистрация FCM-токена не удалась: ${e.code}", e)
-            }
-        }
+        apiClient.setIdentityToken(identityToken)
     }
 
+    /** Что сервер сделал с identity на последнем рукопожатии. */
+    fun identityStatus(): IdentityStatus = client?.identityStatus ?: IdentityStatus.NotProvided
+
     /**
-     * Обработать входящий пуш (из `FirebaseMessagingService.onMessageReceived`).
-     * Возвращает `true`, если пуш наш и обработан. Полезная нагрузка: `{"conversationId": "123"}`.
+     * Привести ленту к серверной: вызывать, когда приложение вернулось на передний план или
+     * его бэкенд получил вебхук `manager_reply` и разбудил приложение пушем.
+     *
+     * Своей отправки пушей у платформы нет: ответ менеджера уходит вебхуком на бэкенд
+     * интегратора, и он же адресует пуш своему пользователю (по `external_user_id`).
+     * Поэтому SDK не принимает FCM-токен и не разбирает полезную нагрузку пуша.
      */
-    fun handlePush(data: Map<String, String>): Boolean {
-        val conversationId = data["conversationId"]?.toLongOrNull() ?: return false
-        val current = controller ?: return false
-        current.openConversation(conversationId)
-        return true
+    fun refresh() {
+        controller?.refresh()
     }
 
     /**
-     * Сбросить состояние SDK (GDPR Art. 17 на стороне клиента): визитор, история, токены.
-     * Серверные данные удаляет `POST /api/v1/widget/visitor/forget` — отдельный вызов.
+     * Сбросить состояние SDK (GDPR Art. 17 на стороне клиента): идентификатор установки,
+     * визитор, лента и токены. Серверные данные мобильного канала удаляются по обращению
+     * в поддержку — своего эндпоинта у канала пока нет.
+     *
+     * ⚠️ После сброса устройство для сервера новое: прежняя переписка останется на старом
+     * идентификаторе установки и в приложении больше не покажется.
      */
     fun reset() {
         controller?.stop()
@@ -202,7 +195,7 @@ object MeerBot {
         controller = null
         configuration = null
         visitorUuid = null
-        pendingPushToken = null
+        pendingIdentityToken = null
         prefs?.edit()?.clear()?.apply()
     }
 
@@ -241,13 +234,20 @@ object MeerBot {
         return encrypted
     }
 
-    private fun getOrCreateVisitorUuid(): String {
+    /**
+     * Прочитать сохранённое значение или создать новое. `visitorUuid` сервер валидирует
+     * ровно по длине 36, поэтому мусор из старых версий отбрасывается.
+     */
+    private fun getOrCreate(key: String, create: () -> String): String {
         val store = prefs
-        val existing = store?.getString(KEY_VISITOR_UUID, null)
-        // Сервер валидирует visitorUuid ровно по длине 36 — мусор из старых версий отбрасываем.
-        if (existing != null && existing.length == 36) return existing
-        val fresh = UUID.randomUUID().toString()
-        store?.edit()?.putString(KEY_VISITOR_UUID, fresh)?.apply()
+        val existing = store?.getString(key, null)
+        if (!existing.isNullOrEmpty() &&
+            (key != KEY_VISITOR_UUID || existing.length == 36)
+        ) {
+            return existing
+        }
+        val fresh = create()
+        store?.edit()?.putString(key, fresh)?.apply()
         return fresh
     }
 }

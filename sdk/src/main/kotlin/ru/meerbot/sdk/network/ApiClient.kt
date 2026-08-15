@@ -25,39 +25,50 @@ import java.util.Locale
 import java.util.TimeZone
 import java.util.concurrent.TimeUnit
 
-/** Ответ handshake `/api/v1/widget/session`. */
-data class WidgetSession(
+/** Ответ рукопожатия `/api/v1/mobile/register`. */
+data class MobileSession(
+    val deviceId: String,
     val jwt: String,
     val expiresIn: Int,
-    val conversationId: Long?,
-    val mode: ChatMode,
-    val title: String?,
-    val greeting: String?,
+    val attestationRequired: Boolean,
+    val identityStatus: IdentityStatus,
 )
 
-/** Сообщение из истории `/api/v1/widget/messages`. */
+/** Страница истории: сервер отдаёт вместе с сообщениями и текущий режим диалога. */
+data class HistoryPage(
+    val messages: List<HistoryMessage>,
+    val hasMore: Boolean,
+    val mode: ChatMode,
+)
+
+/** Сообщение из истории `/api/v1/mobile/messages`. */
 data class HistoryMessage(
     val id: Long,
     val role: String,
     val content: String,
+    val authorName: String?,
     val createdAtMs: Long,
 )
 
-/** Ответ `/api/v1/mobile/register`. */
-data class DeviceRegistration(
-    val deviceId: String,
-    val attestationRequired: Boolean,
-)
-
 /**
- * Клиент платформы: держит JWT, обновляет его по истечении и стримит ответы.
+ * Клиент канала `mobile_app`: держит JWT, обновляет его по истечении и стримит ответы.
  *
- * Потокобезопасен: handshake сериализован мьютексом, поэтому параллельные отправки не
+ * Потокобезопасен: рукопожатие сериализовано мьютексом, поэтому параллельные отправки не
  * выписывают по своему JWT (сервер держит jti-allowlist, лишние токены — мусор).
  */
 class ApiClient(
     private val config: MeerBotConfiguration,
     private val visitorUuid: String,
+    /**
+     * Стабильный идентификатор установки. Уходит в поле `deviceToken` рукопожатия: сервер
+     * ключует по нему `MobileDevice`, а тред диалога — по устройству. Поэтому значение
+     * обязано пережить и перезапуск, и получение пуш-токена: подменить его — значит начать
+     * пользователю новую переписку с чистого листа.
+     *
+     * Пуш-токен сюда НЕ кладётся: своей отправки пушей у платформы нет, ответ менеджера
+     * уходит вебхуком на бэкенд интегратора (план поставки 1, этап E).
+     */
+    private val installationId: String,
     private val httpClient: OkHttpClient = defaultHttpClient(),
 ) {
 
@@ -69,7 +80,10 @@ class ApiClient(
     @Volatile
     private var jwtExpiresAtMs: Long = 0L
 
-    /** Диалог текущей сессии. Проставляется из handshake/`meta`, уходит в тело следующего запроса. */
+    @Volatile
+    private var identityToken: String? = null
+
+    /** Диалог текущего устройства. Приходит из `meta`; в запросы НЕ уходит. */
     @Volatile
     var conversationId: Long? = null
         private set
@@ -79,50 +93,61 @@ class ApiClient(
     var lastMessageId: Long? = null
         private set
 
-    fun setConversationId(id: Long?) {
-        conversationId = id
+    /** Статус identity с последнего рукопожатия. */
+    @Volatile
+    var identityStatus: IdentityStatus = IdentityStatus.NotProvided
+        private set
+
+    /**
+     * Подписанный бэкендом интегратора токен идентичности. Следующее рукопожатие уйдёт с ним;
+     * текущая сессия сбрасывается, иначе identity подхватилась бы только через 15 минут.
+     */
+    fun setIdentityToken(token: String?) {
+        identityToken = token
+        invalidateToken()
     }
 
-    // ─── Handshake ────────────────────────────────────────────────────────────────────────
+    // ─── Рукопожатие ──────────────────────────────────────────────────────────────────────
 
-    /** Открыть сессию виджета. Повторный вызов выдаёт новый JWT на тот же visitorUuid. */
-    suspend fun openSession(): WidgetSession = tokenMutex.withLock { openSessionLocked() }
+    suspend fun openSession(): MobileSession = tokenMutex.withLock { openSessionLocked() }
 
-    private suspend fun openSessionLocked(): WidgetSession {
+    private suspend fun openSessionLocked(): MobileSession {
         val body = JSONObject()
             .put("key", config.apiKey)
+            .put("deviceToken", installationId)
+            .put("platform", "android")
             .put("visitorUuid", visitorUuid)
-            .put("hostOrigin", config.origin)
+            .put("sdkVersion", config.sdkVersion)
+        identityToken?.let { body.put("identityToken", it) }
 
-        val request = newRequest("/api/v1/widget/session")
+        val request = newRequest("/api/v1/mobile/register")
             .post(body.toString().toRequestBody(JSON))
             .build()
 
         val json = executeJson(request)
         val token = json.optStringOrNull("jwt") ?: throw MeerBotError.InvalidResponse
+        val deviceId = json.optStringOrNull("deviceId") ?: throw MeerBotError.InvalidResponse
         val expiresIn = json.optInt("expiresIn", 0)
         if (expiresIn <= 0) throw MeerBotError.InvalidResponse
 
         jwt = token
         jwtExpiresAtMs = System.currentTimeMillis() + expiresIn * 1000L
 
-        val widget = json.optJSONObject("widget")
-        val restored = json.optLongOrNull("conversationId")
-        if (restored != null) conversationId = restored
+        val status = IdentityStatus.from(json.optJSONObject("identity")?.optStringOrNull("status"))
+        identityStatus = status
 
-        return WidgetSession(
+        return MobileSession(
+            deviceId = deviceId,
             jwt = token,
             expiresIn = expiresIn,
-            conversationId = restored,
-            mode = ChatMode.from(json.optString("mode")),
-            title = widget?.optStringOrNull("title"),
-            greeting = widget?.optStringOrNull("greeting"),
+            attestationRequired = json.optBoolean("attestationRequired", false),
+            identityStatus = status,
         )
     }
 
     /**
-     * Действующий JWT: переиспользуем, пока до истечения больше минуты, иначе — новый handshake.
-     * Параллельные вызовы ждут на мьютексе и получают уже обновлённый токен.
+     * Действующий JWT: переиспользуем, пока до истечения больше минуты, иначе — новое
+     * рукопожатие. Параллельные вызовы ждут на мьютексе и получают уже обновлённый токен.
      */
     suspend fun validToken(): String = tokenMutex.withLock {
         val current = jwt
@@ -138,46 +163,15 @@ class ApiClient(
         jwtExpiresAtMs = 0L
     }
 
-    // ─── Регистрация устройства (FCM) ─────────────────────────────────────────────────────
-
-    /** Зарегистрировать FCM-токен. Требует ключ мобильного приложения (`pushApiKey`). */
-    suspend fun registerDevice(fcmToken: String): DeviceRegistration {
-        val pushApiKey = config.pushApiKey
-        if (pushApiKey.isNullOrEmpty()) throw MeerBotError.NotConfigured
-
-        val body = JSONObject()
-            .put("key", pushApiKey)
-            .put("deviceToken", fcmToken)
-            .put("platform", "android")
-            .put("visitorUuid", visitorUuid)
-            .put("sdkVersion", config.sdkVersion)
-
-        val request = newRequest("/api/v1/mobile/register")
-            .post(body.toString().toRequestBody(JSON))
-            .build()
-
-        val json = executeJson(request)
-        val deviceId = json.optStringOrNull("deviceId") ?: throw MeerBotError.InvalidResponse
-        // JWT из этого ответа СОЗНАТЕЛЬНО не сохраняем: он подписан на пространство id мобильного
-        // приложения и для /widget/chat/stream невалиден (см. MeerBotConfiguration).
-        return DeviceRegistration(
-            deviceId = deviceId,
-            attestationRequired = json.optBoolean("attestationRequired", false),
-        )
-    }
-
     // ─── История (догон после обрыва) ─────────────────────────────────────────────────────
 
     /**
-     * История диалога. Без `since` возвращает последние [limit] сообщений треда — именно это
-     * нужно для замены ленты после обрыва; `since` — инкрементальный догон.
+     * История диалога. Диалог сервер резолвит по устройству из токена — передавать его id
+     * клиенту нечем и незачем.
      */
-    suspend fun history(since: Long? = null, limit: Int = 50): List<HistoryMessage> {
-        val conversation = conversationId ?: return emptyList()
-
-        val url = (config.baseUrl.trimEnd('/') + "/api/v1/widget/messages").toHttpUrl()
+    suspend fun history(since: Long? = null, limit: Int = 50): HistoryPage {
+        val url = (config.baseUrl.trimEnd('/') + "/api/v1/mobile/messages").toHttpUrl()
             .newBuilder()
-            .addQueryParameter("conversationId", conversation.toString())
             .addQueryParameter("limit", limit.toString())
             .apply { if (since != null) addQueryParameter("since", since.toString()) }
             .build()
@@ -197,16 +191,22 @@ class ApiClient(
             val item = raw.optJSONObject(i) ?: continue
             val id = item.optLongOrNull("id") ?: continue
             val role = item.optStringOrNull("role") ?: continue
-            val content = item.optString("content")
             messages += HistoryMessage(
                 id = id,
                 role = role,
-                content = content,
+                content = item.optString("content"),
+                authorName = item.optStringOrNull("authorName"),
                 createdAtMs = parseTimestamp(item.optStringOrNull("createdAt")),
             )
         }
         messages.lastOrNull()?.let { lastMessageId = it.id }
-        return messages
+        // Режим приходит той же страницей: только так клиент узнаёт, что диалог закрыт или
+        // уже ведёт менеджер, — рукопожатие канала режима не отдаёт.
+        return HistoryPage(
+            messages = messages,
+            hasMore = json.optBoolean("hasMore", false),
+            mode = ChatMode.from(json.optStringOrNull("mode")),
+        )
     }
 
     // ─── Стрим ответа ─────────────────────────────────────────────────────────────────────
@@ -217,7 +217,8 @@ class ApiClient(
      * События эмитятся по мере поступления. При обрыве поток выбрасывает
      * [MeerBotError.Network] — уже доставленные события остаются доставленными, вызывающая
      * сторона решает, догонять ли историю. Истёкший JWT (401 `jwt_*`) обновляется прозрачно,
-     * запрос повторяется РОВНО один раз.
+     * запрос повторяется РОВНО один раз; 403 `channel_mismatch` не повторяется никогда —
+     * перепутан ключ, и новый токен будет ровно таким же.
      */
     fun sendMessage(text: String): Flow<ChatStreamEvent> = flow {
         runStream(text, allowRetry = true, collector = this)
@@ -229,9 +230,8 @@ class ApiClient(
         collector: FlowCollector<ChatStreamEvent>,
     ) {
         val body = JSONObject().put("message", text)
-        conversationId?.let { body.put("conversationId", it) }
 
-        val request = newRequest("/api/v1/widget/chat/stream")
+        val request = newRequest("/api/v1/mobile/chat/stream")
             .post(body.toString().toRequestBody(JSON))
             .header("Accept", "text/event-stream")
             .header("Authorization", "Bearer ${validToken()}")
@@ -258,7 +258,6 @@ class ApiClient(
             response.use {
                 if (!it.isSuccessful) {
                     val error = decodeError(it.code, it.body?.string())
-                    // Единственный автоматический повтор — на протухший токен.
                     if (allowRetry && error.isExpiredToken) {
                         invalidateToken()
                         runStream(text, allowRetry = false, collector = collector)
@@ -301,13 +300,12 @@ class ApiClient(
             .url(config.baseUrl.trimEnd('/') + path)
             .applyCommonHeaders()
 
+    // `Origin` не отправляется сознательно: у нативного приложения его нет, а сервер
+    // мобильного канала по нему ничего не проверяет (тира лимитов по origin у канала тоже нет).
     private fun Request.Builder.applyCommonHeaders(): Request.Builder =
-        // Origin здесь — обычный заголовок (в отличие от браузера): сервер пинует по нему
-        // публичный ключ и сверяет с `oid` в JWT.
-        header("Origin", config.origin)
-            .header("X-SDK-Version", config.sdkVersion)
+        header("X-SDK-Version", config.sdkVersion)
 
-    /** Запрос без Authorization (handshake, регистрация устройства). */
+    /** Запрос без Authorization (рукопожатие). */
     private suspend fun executeJson(request: Request): JSONObject = withContext(Dispatchers.IO) {
         val response = try {
             httpClient.newCall(request).execute()
@@ -346,7 +344,10 @@ class ApiClient(
             .readTimeout(30, TimeUnit.SECONDS)
             .build()
 
-        /** Ошибки платформы приходят в форме Stripe/OpenAI: `{error:{type,code,message}}`. */
+        /**
+         * Отказы канала приходят в форме `{error:{code,message}}` — без поля `type`,
+         * в отличие от веб-виджета. Читаем только `code`: он единственный машинный.
+         */
         fun decodeError(status: Int, body: String?): MeerBotError.Http {
             val error = body
                 ?.let { runCatching { JSONObject(it) }.getOrNull() }
