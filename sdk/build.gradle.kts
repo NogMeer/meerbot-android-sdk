@@ -24,6 +24,7 @@ android {
         minSdk = 24
         consumerProguardFiles("consumer-rules.pro")
         buildConfigField("String", "SDK_VERSION", "\"$sdkVersion\"")
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildFeatures {
@@ -76,11 +77,13 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.squareup.okhttp3:okhttp-sse:4.12.0")
 
-    // visitorUuid и conversationId хранятся в зашифрованных prefs
-    implementation("androidx.security:security-crypto:1.1.0-alpha06")
+    // visitorUuid хранится в зашифрованных prefs. Версия стабильная: тащить alpha-крипту
+    // в чужое приложение нельзя.
+    implementation("androidx.security:security-crypto:1.1.0")
 
     debugImplementation(composeBom)
     debugImplementation("androidx.compose.ui:ui-tooling")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
@@ -88,6 +91,13 @@ dependencies {
     // В unit-тестах android.jar отдаёт org.json заглушками (все методы null/0), поэтому
     // разбор ответов проверялся бы вхолостую. Настоящая реализация — из этой зависимости.
     testImplementation("org.json:json:20240303")
+
+    // Инструментальные тесты экрана: гоняются на эмуляторе (`connectedDebugAndroidTest`).
+    // Именно они держат связку UI ↔ состояние, которой в каркасе не было вовсе.
+    androidTestImplementation(composeBom)
+    androidTestImplementation("androidx.compose.ui:ui-test-junit4")
+    androidTestImplementation("androidx.test.ext:junit:1.1.5")
+    androidTestImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
 }
 
 publishing {

@@ -43,6 +43,10 @@ android {
         release {
             isMinifyEnabled = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
+            // Демо релизится только на эмулятор: подпись отладочная, чтобы урезанный R8
+            // сборкой SDK можно было реально запустить, а не только скомпилировать.
+            // Consumer-правила проверяются именно так.
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 }

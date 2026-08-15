@@ -20,3 +20,9 @@
 -dontwarn org.conscrypt.**
 -dontwarn org.bouncycastle.**
 -dontwarn org.openjsse.**
+
+# EncryptedSharedPreferences тянет Tink, а тот скомпилирован со ссылками на аннотации
+# errorprone, которых нет в рантайме. Без этого правила R8 у ПОТРЕБИТЕЛЯ падает на
+# «Missing class com.google.errorprone.annotations.*» — то есть наша зависимость ломает
+# release-сборку чужого приложения. Проверено: demo:assembleRelease.
+-dontwarn com.google.errorprone.annotations.**

@@ -29,7 +29,6 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
@@ -184,14 +183,25 @@ private fun MessageBubble(message: ChatMessage, accent: Color) {
     val roleDescription = stringResource(
         if (isUser) R.string.meerbot_message_from_you else R.string.meerbot_message_from_bot
     )
+    val notDelivered = stringResource(R.string.meerbot_not_delivered)
+    // Пузырь читается вслух одной репликой: «Ваше сообщение: …», а не по кускам. Недоставку
+    // включаем в ту же реплику — иначе о ней узнают только зрячие.
+    val bubbleDescription = buildString {
+        append(roleDescription)
+        append(": ")
+        append(message.content)
+        if (message.failed) {
+            append(", ")
+            append(notDelivered)
+        }
+    }
 
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 12.dp, vertical = 4.dp)
-            // Пузырь читается вслух одной репликой: «Ваше сообщение: …», а не по кускам.
-            .clearAndSetSemantics {
-                contentDescription = "$roleDescription: ${message.content}"
+            .semantics(mergeDescendants = true) {
+                contentDescription = bubbleDescription
             },
         horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start,
     ) {
