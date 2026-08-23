@@ -26,8 +26,13 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -59,6 +64,25 @@ fun ChatScreen(
     val listState = rememberLazyListState()
     val accent = primaryColor ?: MaterialTheme.colorScheme.primary
     val listDescription = stringResource(R.string.meerbot_messages_list)
+
+    // Протягивание переписки убирает клавиатуру — так ведёт себя любой мессенджер, и без
+    // этого выйти из ввода нечем: своей кнопки «Готово» у поля нет, а хост-приложение
+    // обычно показывает экран без панели действий. Зеркало iOS-поведения
+    // (`scrollDismissesKeyboard` в ChatView).
+    //
+    // Реагируем только на палец (`Drag`): программная прокрутка к свежему сообщению не
+    // должна закрывать клавиатуру человеку, который в этот момент печатает.
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val dismissKeyboardOnScroll = remember(keyboardController) {
+        object : NestedScrollConnection {
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                if (source == NestedScrollSource.Drag && available.y != 0f) {
+                    keyboardController?.hide()
+                }
+                return Offset.Zero
+            }
+        }
+    }
 
     // Handshake — на первом показе экрана, а не на старте приложения: иначе визитор
     // записывался бы каждому, кто чат ни разу не открыл.
@@ -95,6 +119,7 @@ fun ChatScreen(
                     state = listState,
                     modifier = Modifier
                         .fillMaxSize()
+                        .nestedScroll(dismissKeyboardOnScroll)
                         .semantics {
                             contentDescription = listDescription
                         },
