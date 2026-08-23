@@ -1,0 +1,6 @@
+# JitPack собирает зеркало сам: JDK по умолчанию у него ниже 17, а сборка требует 17
+# (AGP 8.5 + Kotlin jvmTarget 17). Без этого файла сборка падает на «Unsupported class file».
+jdk:
+  - openjdk17
+install:
+  - ./gradlew :sdk:publishToMavenLocal -x lint

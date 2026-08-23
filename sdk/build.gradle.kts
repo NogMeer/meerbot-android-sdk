@@ -102,9 +102,13 @@ dependencies {
 publishing {
     publications {
         register<MavenPublication>("release") {
-            groupId = "ru.meerbot"
+            // Координаты переопределяемы СБОРЩИКОМ: JitPack собирает зеркало сам и передаёт
+            // `-Pgroup=com.github.<owner>.<repo>` и `-Pversion=<тег>`. Зашей мы `ru.meerbot`
+            // намертво — артефакт лёг бы в mavenLocal под чужой группой, JitPack не нашёл бы
+            // его и отдал интегратору «artifact not found» вместо библиотеки.
+            groupId = providers.gradleProperty("group").getOrElse("ru.meerbot")
             artifactId = "sdk"
-            version = sdkVersion
+            version = providers.gradleProperty("version").getOrElse(sdkVersion)
 
             afterEvaluate {
                 from(components["release"])
