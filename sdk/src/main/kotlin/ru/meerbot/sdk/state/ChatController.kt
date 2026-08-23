@@ -237,11 +237,17 @@ class ChatController(
         ChatMessage(
             id = "srv-${item.id}",
             role = item.role,
-            // Ответ менеджера отличается от ответа ИИ именем автора: канал отдаёт его в
-            // истории, и терять это на догоне нельзя — в ленте появился бы «ИИ», который
-            // на самом деле человек.
+            // Автор берётся из `authorKind`, а не выводится из наличия подписи: менеджер
+            // без имени (учётка без ФИО) считался бы ИИ, то есть ответ живого человека в
+            // ленте оказывался бы ответом бота. Отсутствие поля — старая сборка платформы,
+            // фолбэк на прежнее правило.
             author = if (item.role == "assistant") {
-                if (item.authorName != null) "manager" else "ai"
+                when {
+                    item.authorKind == "manager" -> "manager"
+                    item.authorKind != null -> "ai"
+                    item.authorName != null -> "manager"
+                    else -> "ai"
+                }
             } else null,
             authorName = item.authorName,
             content = item.content,

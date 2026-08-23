@@ -46,6 +46,10 @@ data class HistoryMessage(
     val id: Long,
     val role: String,
     val content: String,
+    /** `ai` | `manager` у ответов ассистентской роли, иначе `null`. Машинный дискриминатор:
+     *  подпись (`authorName`) у менеджера может отсутствовать, а автор — нет. Сервер отдаёт
+     *  поле с 2026-08-23; у старых сборок платформы его нет. */
+    val authorKind: String?,
     val authorName: String?,
     val createdAtMs: Long,
 )
@@ -195,6 +199,7 @@ class ApiClient(
                 id = id,
                 role = role,
                 content = item.optString("content"),
+                authorKind = item.optStringOrNull("authorKind"),
                 authorName = item.optStringOrNull("authorName"),
                 createdAtMs = parseTimestamp(item.optStringOrNull("createdAt")),
             )

@@ -217,6 +217,35 @@ class ChatControllerTest {
         assertEquals("Марат", message.authorName)
     }
 
+    /**
+     * Менеджер без подписи (учётка без ФИО) — тоже менеджер.
+     *
+     * Правило «есть имя → человек» ломалось на таком ответе: пользователь видел живого
+     * оператора как бота. Дискриминатор теперь машинный (`authorKind`), имя — только для UI.
+     */
+    @Test
+    fun `менеджер без имени всё равно менеджер`() {
+        val controller = started(
+            mode = "human",
+            messages = """{"id":9,"role":"assistant","content":"уже смотрю","authorKind":"manager","createdAt":"2026-08-14T10:00:00.000Z"}"""
+        )
+
+        val message = controller.state.value.messages.single()
+        assertEquals("manager", message.author)
+        assertNull(message.authorName)
+    }
+
+    /** Старая сборка платформы поля не отдаёт — прежнее правило по имени остаётся в силе. */
+    @Test
+    fun `история без authorKind читается по прежнему правилу`() {
+        val controller = started(
+            mode = "ai",
+            messages = """{"id":9,"role":"assistant","content":"ответ","createdAt":"2026-08-14T10:00:00.000Z"}"""
+        )
+
+        assertEquals("ai", controller.state.value.messages.single().author)
+    }
+
     @Test
     fun `в закрытом диалоге отправка не уходит`() {
         val controller = started(mode = "closed")
