@@ -19,7 +19,7 @@
     <string name="meerbot_message_from_you">Ваше сообщение</string>
     <string name="meerbot_message_from_bot">Сообщение поддержки</string>
     <string name="meerbot_err_not_configured">Чат не настроен. Вызовите MeerBot.configure(context, apiKey).</string>
-    <string name="meerbot_err_key_invalid">Неверный ключ или домен приложения не разрешён в кабинете.</string>
+    <string name="meerbot_err_key_invalid">Неверный или отозванный ключ приложения.</string>
     <string name="meerbot_err_channel_off">Канал отключён в кабинете.</string>
     <string name="meerbot_err_quota">Чат временно недоступен. Попробуйте позже.</string>
     <string name="meerbot_err_conv_cap">Месячный лимит диалогов исчерпан.</string>

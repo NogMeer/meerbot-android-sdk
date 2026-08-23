@@ -14,7 +14,7 @@
     <string name="meerbot_message_from_you">Your message</string>
     <string name="meerbot_message_from_bot">Support message</string>
     <string name="meerbot_err_not_configured">Chat is not configured. Call MeerBot.configure(context, apiKey).</string>
-    <string name="meerbot_err_key_invalid">Invalid key, or the app domain is not allowed in the dashboard.</string>
+    <string name="meerbot_err_key_invalid">Invalid or revoked app key.</string>
     <string name="meerbot_err_channel_off">The channel is disabled in the dashboard.</string>
     <string name="meerbot_err_quota">The chat is temporarily unavailable. Try again later.</string>
     <string name="meerbot_err_conv_cap">Monthly conversation limit reached.</string>
