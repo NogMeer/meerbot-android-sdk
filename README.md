@@ -3,7 +3,7 @@
 Экран чата с ИИ-ассистентом MeerBot внутри вашего Android-приложения: Compose-экран,
 потоковые ответы (SSE), подключение менеджера, догон истории после обрыва связи.
 
-**Статус:** `0.2.0-alpha` — работает на собственном канале платформы (`mobile_app`): один
+**Статус:** `0.2.0` — работает на собственном канале платформы (`mobile_app`): один
 ключ, свои эндпоинты, свой диалог на устройство. Не сделано: вложения, Play Integrity,
 cert pinning. См. [Границы](#границы-текущей-версии).
 
@@ -21,13 +21,13 @@ cert pinning. См. [Границы](#границы-текущей-версии
 
 ```kotlin
 dependencies {
-    implementation("ru.meerbot:sdk:0.2.0-alpha")
+    implementation("ru.meerbot:sdk:0.2.0")
 }
 ```
 
 > Зеркала репозитория, в отличие от iOS, здесь нет и не нужно: Gradle ставит **артефакт**,
 > а не репозиторий. Сегодня артефакт собирается локально
-> (`scripts/release-android-sdk.sh 0.2.0-alpha` → `sdk/build/repo`), публичный Maven ещё не
+> (`scripts/release-android-sdk.sh 0.2.0` → `sdk/build/repo`), публичный Maven ещё не
 > подключён — см. [Публикация](#публикация).
 
 ---
@@ -192,8 +192,8 @@ demo/                               демо-приложение (аналог 
 ### Публикация
 
 ```bash
-scripts/release-android-sdk.sh 0.2.0-alpha --dry-run   # только проверки
-scripts/release-android-sdk.sh 0.2.0-alpha             # собрать артефакт в sdk/build/repo
+scripts/release-android-sdk.sh 0.2.0 --dry-run   # только проверки
+scripts/release-android-sdk.sh 0.2.0             # собрать артефакт в sdk/build/repo
 ```
 
 Гейты: чистое рабочее дерево `mobile-sdk-android`, `SDK_VERSION` в `gradle.properties`

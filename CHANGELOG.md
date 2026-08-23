@@ -4,6 +4,17 @@
 [semver](https://semver.org/lang/ru/). До `1.0.0` минорная версия может ломать API
 (см. `docs/mobile-sdk/versioning.md`).
 
+## [0.2.0] — 2026-08-23
+
+### Изменено
+- `identify(token)` — параметр переименован из `identityToken` ради единого имени во всех трёх
+  SDK (контракт — `docs/mobile-sdk/api-reference.md`). Позиционный вызов не ломается.
+- Автор ответа в истории берётся из `authorKind`, а не из наличия подписи: менеджер без ФИО в
+  учётке показывался ИИ.
+- Версия выпуска: `0.2.0-alpha` → `0.2.0`. Функционально это тот же выпуск — alpha снята,
+  потому что iOS того же канала выходит как `0.2.0`, и разные суффиксы у одного контракта
+  пришлось бы объяснять каждому интегратору.
+
 ## [0.2.0-alpha] — 2026-08-15
 
 Переезд на собственный канал платформы. Ломающее изменение: меняются и адреса, и ключ, и
@@ -106,5 +117,5 @@
 - Сквозной прогон выполнен против локального стенда контракта; прогон по реальному ключу
   прода — открытая задача (`docs/TASKS.md`, Ф6).
 
-[0.2.0-alpha]: https://github.com/NogMeer/agentbot-platform/tree/main/mobile-sdk-android
+[0.2.0]: https://github.com/NogMeer/agentbot-platform/tree/main/mobile-sdk-android
 [0.1.0-alpha]: https://github.com/NogMeer/agentbot-platform/tree/main/mobile-sdk-android

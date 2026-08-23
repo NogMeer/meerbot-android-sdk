@@ -28,7 +28,7 @@ import ru.meerbot.sdk.ui.ChatScreen as ChatScreenImpl
  * ```
  * MeerBot.configure(context, apiKey = "pk_live_…")   // старт приложения
  * MeerBot.ChatScreen()                               // Compose-экран чата
- * MeerBot.identify(identityToken)                    // если пользователь вошёл
+ * MeerBot.identify(token)                            // если пользователь вошёл
  * ```
  *
  * SDK работает с каналом `mobile_app`: один ключ, свои эндпоинты, свой тред на устройство
@@ -156,13 +156,13 @@ object MeerBot {
      *
      * `null` — выход пользователя: следующая сессия будет анонимной.
      */
-    fun identify(identityToken: String?) {
+    fun identify(token: String?) {
         val apiClient = client
         if (apiClient == null) {
-            pendingIdentityToken = identityToken
+            pendingIdentityToken = token
             return
         }
-        apiClient.setIdentityToken(identityToken)
+        apiClient.setIdentityToken(token)
     }
 
     /** Что сервер сделал с identity на последнем рукопожатии. */
