@@ -21,7 +21,7 @@ cert pinning. См. [Границы](#границы-текущей-версии
 
 ```kotlin
 dependencies {
-    implementation("com.github.NogMeer:meerbot-android-sdk:0.2.0")
+    implementation("com.github.NogMeer:meerbot-android-sdk:0.2.1")
 }
 ```
 
