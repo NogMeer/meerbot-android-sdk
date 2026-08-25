@@ -88,9 +88,25 @@ fun ChatScreen(
     // записывался бы каждому, кто чат ни разу не открыл.
     LaunchedEffect(controller) { controller.start() }
 
+    // Первая порция истории уже показана? До неё прыжок вниз делается БЕЗ анимации.
+    //
+    // История грузится асинхронно уже после открытия экрана, поэтому анимированный скролл
+    // на ней читается как «чат открылся сверху и поехал вниз» — мессенджеры так себя не
+    // ведут, переписка обязана открываться сразу на последнем сообщении. Анимация остаётся
+    // там, где она уместна: новое сообщение в открытом чате. Зеркало iOS (`didInitialScroll`).
+    // `remember`, а не `rememberSaveable`: при пересоздании экрана история перезагружается
+    // с нуля, и мгновенный прыжок вниз там снова уместен.
+    var didInitialScroll by remember { mutableStateOf(false) }
+
     LaunchedEffect(state.messages.size, state.messages.lastOrNull()?.content) {
-        if (state.messages.isNotEmpty()) {
-            listState.animateScrollToItem(state.messages.size - 1)
+        if (state.messages.isEmpty()) return@LaunchedEffect
+        val lastIndex = state.messages.size - 1
+        if (didInitialScroll) {
+            listState.animateScrollToItem(lastIndex)
+        } else {
+            didInitialScroll = true
+            // Без анимации — экран должен ОТКРЫТЬСЯ внизу, а не доехать туда.
+            listState.scrollToItem(lastIndex)
         }
     }
 
