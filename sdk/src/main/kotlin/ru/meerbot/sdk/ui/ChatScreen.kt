@@ -2,6 +2,7 @@ package ru.meerbot.sdk.ui
 
 import android.provider.Settings
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -268,11 +269,23 @@ private fun MessageBubble(message: ChatMessage, accent: Color) {
                     )
                     Spacer(modifier = Modifier.height(2.dp))
                 }
-                Text(
-                    message.content + if (message.streaming) " ▍" else "",
-                    color = textColor,
-                    style = MaterialTheme.typography.bodyMedium,
-                )
+                if (message.streaming && message.content.isEmpty()) {
+                    // Модель ещё думает — текста нет вовсе. Раньше здесь оставался ОДИН
+                    // символ `▍`, и пузырь выглядел как обрывок непонятного глифа: человек
+                    // не понимал, ответ это или сбой. Три пульсирующие точки — то, чем
+                    // «собеседник печатает» показывают все мессенджеры, объяснять их не надо.
+                    TypingDots()
+                } else {
+                    // Текст уже пошёл — курсор в конце строки читается как курсор (так
+                    // делают ChatGPT и Claude), но ТОЛЬКО мигающий: статичный символ в
+                    // конце ответа неотличим от опечатки бота.
+                    val cursor = if (message.streaming && blinkVisible()) "▍" else ""
+                    Text(
+                        message.content + cursor,
+                        color = textColor,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
             }
             if (message.failed) {
                 Text(
@@ -438,6 +451,27 @@ private fun ChatInput(
 }
 
 /** Системная настройка «убрать анимации» (Специальные возможности → Удалить анимацию). */
+/**
+ * Фаза мигания курсора при стриминге: полсекунды виден, полсекунды нет.
+ *
+ * При системной «отключить анимации» курсор показывается ПОСТОЯННО, а не пропадает:
+ * признак «ответ ещё пишется» нужен и там, мигание — лишь способ его подать.
+ */
+@Composable
+private fun blinkVisible(): Boolean {
+    if (animationsDisabled()) return true
+    val transition = rememberInfiniteTransition(label = "meerbot-cursor")
+    val phase by transition.animateFloat(
+        initialValue = 0f,
+        targetValue = 2f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1000, easing = LinearEasing),
+        ),
+        label = "meerbot-cursor-phase",
+    )
+    return phase < 1f
+}
+
 @Composable
 private fun animationsDisabled(): Boolean {
     val context = LocalContext.current
