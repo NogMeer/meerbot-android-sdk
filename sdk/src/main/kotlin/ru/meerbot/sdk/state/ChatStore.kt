@@ -23,6 +23,14 @@ data class ChatMessage(
     /** Сообщение не доставлено (обрыв сети при отправке) — UI показывает возможность повтора. */
     val failed: Boolean = false,
     val timestamp: Long = System.currentTimeMillis(),
+    /**
+     * id строки на сервере — ключ слияния при догоне ленты.
+     *
+     * Отдельно от `id`: тот обязан существовать с первого кадра, ещё до отправки
+     * (оптимистичное сообщение пользователя). `null` — строка пока живёт только на устройстве.
+     * Параметр последний в списке: позиционные вызовы у хостов не должны сломаться.
+     */
+    val serverId: Long? = null,
 )
 
 enum class ChatMode(val raw: String) {
@@ -59,6 +67,8 @@ data class ChatState(
     val ready: Boolean = false,
     /** Текст, который не удалось отправить: UI показывает «Повторить». */
     val retryable: String? = null,
+    /** Наибольший серверный id в ленте — курсор догона (`GET /mobile/messages?since=`). */
+    val lastServerMessageId: Long = 0L,
 )
 
 class ChatStore {
@@ -141,8 +151,60 @@ class ChatStore {
         current.copy(messages = current.messages.filterNot { it.id == id && it.content.isEmpty() })
     }
 
+    val lastServerMessageId: Long get() = _state.value.lastServerMessageId
+
     /** Заменить всю ленту (догон истории с сервера — сервер источник правды). */
-    fun replaceAll(items: List<ChatMessage>) = _state.update { it.copy(messages = items) }
+    fun replaceAll(items: List<ChatMessage>) = _state.update {
+        it.copy(messages = items, lastServerMessageId = bumpCursor(it.lastServerMessageId, items))
+    }
+
+    /**
+     * Влить серверную страницу в ленту. Идемпотентно по `serverId`. Зеркало iOS
+     * `ChatStore.mergeServerMessages`.
+     *
+     * Три случая, и порядок между ними важен:
+     *   1. `serverId` уже в ленте — пропускаем (повторная страница догона — это норма);
+     *   2. есть локальный двойник (тот же `role` и текст, ещё без серверного id) — ПРОМОУТИМ
+     *      его, а не добавляем второй: иначе своё же сообщение пользователь увидит дважды,
+     *      как только догон принесёт его с сервера;
+     *   3. иначе — новое сообщение, добавляем в конец.
+     *
+     * Курсор двигается ВСЕГДА, даже если вся страница пропущена: иначе следующий догон
+     * запросил бы те же строки и цикл никогда бы не сдвинулся.
+     *
+     * @return сколько сообщений реально появилось в ленте.
+     */
+    fun mergeServerMessages(items: List<ChatMessage>): Int {
+        var added = 0
+        _state.update { current ->
+            val merged = current.messages.toMutableList()
+            for (item in items) {
+                if (item.serverId != null && merged.any { it.serverId == item.serverId }) continue
+                val localIdx = merged.indexOfLast {
+                    it.serverId == null && it.role == item.role && it.content == item.content
+                }
+                if (localIdx >= 0) {
+                    merged[localIdx] = merged[localIdx].copy(
+                        serverId = item.serverId,
+                        failed = false,
+                        streaming = false,
+                    )
+                    continue
+                }
+                merged += item
+                added++
+            }
+            current.copy(
+                messages = merged,
+                lastServerMessageId = bumpCursor(current.lastServerMessageId, items),
+            )
+        }
+        return added
+    }
+
+    /** Курсор только растёт: страница старее текущего значения не имеет права его откатить. */
+    private fun bumpCursor(current: Long, items: List<ChatMessage>): Long =
+        maxOf(current, items.mapNotNull { it.serverId }.maxOrNull() ?: 0L)
 
     fun resetForLogout() {
         _state.value = ChatState()
