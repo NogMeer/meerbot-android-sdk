@@ -37,12 +37,16 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import ru.meerbot.sdk.R
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+
 import ru.meerbot.sdk.state.ChatController
 import ru.meerbot.sdk.state.ChatMessage
 import ru.meerbot.sdk.state.ChatMode
@@ -87,7 +91,28 @@ fun ChatScreen(
 
     // Handshake — на первом показе экрана, а не на старте приложения: иначе визитор
     // записывался бы каждому, кто чат ни разу не открыл.
-    LaunchedEffect(controller) { controller.start() }
+    //
+    // Наблюдатель жизненного цикла, а не `LaunchedEffect`: тот срабатывал ровно один раз
+    // (ключ `controller` живёт в синглтоне SDK и не меняется), поэтому возврат приложения из
+    // фона не догонял ленту, а `stop()` не звался ВООБЩЕ — догон крутился бы за закрытым
+    // экраном. На iOS симметрия держится на `.onAppear`/`.onDisappear`.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(controller, lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                // ON_START приходит и на первом показе, и при возврате из фона. `start()` сам
+                // решает: рукопожатие или только догон.
+                Lifecycle.Event.ON_START -> controller.start()
+                Lifecycle.Event.ON_STOP -> controller.stop()
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            controller.stop()
+        }
+    }
 
     // Первая порция истории уже показана? До неё прыжок вниз делается БЕЗ анимации.
     //

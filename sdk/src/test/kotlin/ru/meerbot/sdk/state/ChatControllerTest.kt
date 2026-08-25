@@ -38,6 +38,8 @@ class ChatControllerTest {
 
     @After
     fun tearDown() {
+        ChatController.managerPollIntervalMs = 6_000L
+        ChatController.idlePollIntervalMs = 12_000L
         scope.cancel()
         server.shutdown()
     }
@@ -106,14 +108,29 @@ class ChatControllerTest {
         assertEquals(ChatMode.Human, controller.state.value.mode)
     }
 
+    /**
+     * Экран открыли повторно внутри живого процесса. Рукопожатия второй раз быть не должно
+     * (каждое — новый jti в allowlist), но лента ОБЯЗАНА догнаться: пока экран был закрыт,
+     * менеджер мог ответить. До 0.2.4 здесь стоял молчаливый выход, и ответ не появлялся
+     * до перезапуска приложения.
+     */
     @Test
-    fun `повторный старт не делает второе рукопожатие`() {
+    fun `повторное открытие экрана догоняет ленту без второго рукопожатия`() {
         val controller = started()
+        server.enqueue(
+            history(
+                messages = """{"id":9,"role":"assistant","content":"я тут","authorKind":"manager","authorName":"Роман","createdAt":"2026-08-25T10:00:00.000Z"}""",
+            ),
+        )
 
         controller.start()
-        Thread.sleep(200)
+        await(controller) { it.messages.any { m -> m.content == "я тут" } }
 
-        assertEquals(2, server.requestCount)
+        assertEquals("/api/v1/mobile/register", server.takeRequest().path)
+        assertTrue(server.takeRequest().path!!.startsWith("/api/v1/mobile/messages"))
+        // Третий запрос — догон, а не второе рукопожатие.
+        assertTrue(server.takeRequest().path!!.startsWith("/api/v1/mobile/messages"))
+        assertEquals(3, server.requestCount)
     }
 
     @Test
@@ -285,5 +302,152 @@ class ChatControllerTest {
         controller.send("привет")
 
         await(controller) { it.connectionError == null && !it.sending }
+    }
+}
+
+/**
+ * Догон ленты — единственный надёжный канал «менеджер ответил → пользователь увидел»: поток
+ * живёт только на время ответа бота, а пуш зависит от бэкенда интегратора.
+ *
+ * Тесты ужимают периоды до миллисекунд: проверять шестисекундный тик ожиданием шести секунд
+ * — верный способ получить мигающий набор в релизном скрипте.
+ */
+class ChatControllerCatchUpTest {
+
+    private lateinit var server: MockWebServer
+    private lateinit var scope: CoroutineScope
+
+    @Before
+    fun setUp() {
+        server = MockWebServer()
+        server.start()
+        scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        ChatController.managerPollIntervalMs = 40L
+        ChatController.idlePollIntervalMs = 40L
+    }
+
+    @After
+    fun tearDown() {
+        ChatController.managerPollIntervalMs = 6_000L
+        ChatController.idlePollIntervalMs = 12_000L
+        scope.cancel()
+        server.shutdown()
+    }
+
+    private fun controller(): ChatController = ChatController(
+        client = ApiClient(
+            config = MeerBotConfiguration(
+                apiKey = "pk_live_mobile",
+                baseUrl = server.url("/").toString().trimEnd('/'),
+                sdkVersion = "0.2.4-test",
+            ),
+            visitorUuid = "11111111-1111-1111-1111-111111111111",
+            installationId = "and-22222222-2222-2222-2222-222222222222",
+        ),
+        scope = scope,
+    )
+
+    private fun register() = MockResponse().setBody(
+        """{"deviceId":"42","jwt":"jwt-1","expiresIn":900,"attestationRequired":false,"identity":{"status":"not_provided"}}"""
+    )
+
+    private fun history(mode: String = "ai", messages: String = "") = MockResponse().setBody(
+        """{"messages":[$messages],"hasMore":false,"mode":"$mode"}"""
+    )
+
+    private fun managerMessage(id: Int, text: String) =
+        """{"id":$id,"role":"assistant","content":"$text","authorKind":"manager","authorName":"Роман","createdAt":"2026-08-25T10:00:00.000Z"}"""
+
+    private fun await(controller: ChatController, timeoutMs: Long = 5_000, check: (ChatState) -> Boolean) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (check(controller.state.value)) return
+            Thread.sleep(10)
+        }
+        fail("состояние не дождалось условия: ${controller.state.value}")
+    }
+
+    private fun started(mode: String = "human"): ChatController {
+        server.enqueue(register())
+        server.enqueue(history(mode = mode))
+        val controller = controller()
+        controller.start()
+        await(controller) { it.ready }
+        return controller
+    }
+
+    @Test
+    fun `ответ менеджера доезжает без единой отправки`() {
+        val controller = started()
+        server.enqueue(history(mode = "human", messages = managerMessage(9, "я тут")))
+
+        await(controller) { it.messages.any { m -> m.content == "я тут" } }
+
+        assertEquals("manager", controller.state.value.messages.last().author)
+    }
+
+    @Test
+    fun `догон несёт курсор since, а не тянет ленту целиком`() {
+        val controller = started()
+        server.enqueue(history(mode = "human", messages = managerMessage(9, "первое")))
+        await(controller) { it.messages.isNotEmpty() }
+        server.enqueue(history(mode = "human", messages = managerMessage(10, "второе")))
+        await(controller) { it.messages.size == 2 }
+
+        server.takeRequest() // register
+        server.takeRequest() // стартовая история
+        val firstCatchUp = server.takeRequest().requestUrl!!
+        val secondCatchUp = server.takeRequest().requestUrl!!
+
+        assertNull(firstCatchUp.queryParameter("since"))
+        assertEquals("9", secondCatchUp.queryParameter("since"))
+    }
+
+    @Test
+    fun `повторная страница не дублирует сообщение`() {
+        val controller = started()
+        repeat(3) { server.enqueue(history(mode = "human", messages = managerMessage(9, "я тут"))) }
+
+        await(controller) { it.messages.size == 1 }
+        Thread.sleep(150)
+
+        assertEquals(1, controller.state.value.messages.size)
+    }
+
+    /** Оборванная сеть у того, кто просто смотрит переписку, — не повод красить экран. */
+    @Test
+    fun `ошибка фонового догона не показывается пользователю`() {
+        val controller = started()
+        repeat(3) { server.enqueue(MockResponse().setResponseCode(500)) }
+
+        Thread.sleep(200)
+
+        assertNull(controller.state.value.connectionError)
+    }
+
+    @Test
+    fun `stop останавливает догон`() {
+        val controller = started()
+        repeat(5) { server.enqueue(history(mode = "human")) }
+        Thread.sleep(120)
+
+        controller.stop()
+        val afterStop = server.requestCount
+        Thread.sleep(200)
+
+        assertEquals(afterStop, server.requestCount)
+    }
+
+    /** Экран закрыт — фоновый возврат приложения не имеет права поднимать опрос. */
+    @Test
+    fun `возврат из фона при закрытом экране ничего не делает`() {
+        val controller = started()
+        controller.stop()
+        val afterStop = server.requestCount
+
+        controller.onEnterForeground()
+        Thread.sleep(150)
+
+        assertEquals(afterStop, server.requestCount)
     }
 }

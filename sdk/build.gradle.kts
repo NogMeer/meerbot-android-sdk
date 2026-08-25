@@ -72,6 +72,11 @@ dependencies {
     // обновление lifecycle молча меняло бы версию корутин под сетевым слоем.
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 
+    // Жизненный цикл экрана: догон ленты должен останавливаться в фоне и возобновляться при
+    // возврате. Объявлено ЯВНО по той же причине, что корутины выше — раньше приезжало
+    // транзитивом от activity-compose.
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
+
     // Networking
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.squareup.okhttp3:okhttp-sse:4.12.0")

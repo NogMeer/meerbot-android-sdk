@@ -92,6 +92,15 @@ class ApiClient(
     var conversationId: Long? = null
         private set
 
+    /**
+     * Запомнить id диалога из пуша (`MeerBot.handlePush`). В запросы он по-прежнему не уходит
+     * — тред резолвится по устройству из токена; значение нужно ХОСТУ, чтобы не показывать
+     * баннер о сообщении, открытом сейчас на экране. Паритет с iOS `setConversationId`.
+     */
+    internal fun rememberConversationId(id: Long) {
+        conversationId = id
+    }
+
     /** id последнего известного сообщения — точка догона после обрыва. */
     @Volatile
     var lastMessageId: Long? = null
