@@ -40,8 +40,10 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.LineHeightStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.takeOrElse
 import androidx.compose.ui.unit.sp
 import ru.meerbot.sdk.R
 import androidx.lifecycle.Lifecycle
@@ -420,6 +422,25 @@ private fun ChatInput(
     onSend: (String) -> Unit,
 ) {
     val canSend = draft.isNotBlank() && !sending && !closed
+
+    // Вертикальную метрику поле ввода задаёт САМО, а не берёт из typography хоста. Высота
+    // каретки в BasicTextField равна высоте строки, а высота строки по умолчанию — метрики
+    // шрифта; у дисплейных шрифтов (Gilroy и подобные) они шире букв в полтора раза, и курсор
+    // торчит над и под текстом заметной синей палкой. Явный lineHeight по кеглю прижимает
+    // строку к глифам, Trim.None не даёт срезать её обратно к метрикам, Alignment.Center
+    // держит текст по центру пилюли.
+    //
+    // Пузырям сообщений эта метрика НЕ навязывается: там строки идут одна под другой, и
+    // тесный интервал только слепил бы их — они остаются на typography темы.
+    val baseTextStyle = MaterialTheme.typography.bodyMedium
+    val fieldTextStyle = baseTextStyle.copy(
+        lineHeight = baseTextStyle.fontSize.takeOrElse { 16.sp },
+        lineHeightStyle = LineHeightStyle(
+            alignment = LineHeightStyle.Alignment.Center,
+            trim = LineHeightStyle.Trim.None,
+        ),
+    )
+
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -434,7 +455,7 @@ private fun ChatInput(
                 value = draft,
                 onValueChange = onDraftChange,
                 enabled = !closed,
-                textStyle = MaterialTheme.typography.bodyMedium.copy(
+                textStyle = fieldTextStyle.copy(
                     color = MaterialTheme.colorScheme.onSurface,
                 ),
                 cursorBrush = androidx.compose.ui.graphics.SolidColor(accent),
@@ -453,7 +474,9 @@ private fun ChatInput(
                                 else R.string.meerbot_input_hint
                             ),
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            style = MaterialTheme.typography.bodyMedium,
+                            // Плейсхолдер идёт той же метрикой, что и сам ввод: иначе он
+                            // встаёт на другую базовую линию и прыгает при первом символе.
+                            style = fieldTextStyle,
                         )
                     }
                     inner()
