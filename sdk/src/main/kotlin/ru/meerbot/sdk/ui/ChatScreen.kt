@@ -450,7 +450,19 @@ private fun ChatInput(
             .padding(8.dp),
         verticalAlignment = Alignment.Bottom,
     ) {
-        Box(modifier = Modifier.weight(1f)) {
+        // Пилюля и её минимальная высота живут на РОДИТЕЛЕ, а поле центрируется внутри.
+        // Когда `heightIn(min = 48.dp)` стоял на самом BasicTextField, поле растягивалось до
+        // 48dp, но текст оставался наверху — остаток высоты уходил целиком под строку, и она
+        // висела выше центра пилюли на пару dp. Теперь лишнее делится поровну, а на длинном
+        // тексте (до 5 строк) пилюля растёт от содержимого, как и раньше.
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .heightIn(min = 48.dp)
+                .clip(RoundedCornerShape(20.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant),
+            contentAlignment = Alignment.CenterStart,
+        ) {
             BasicTextField(
                 value = draft,
                 onValueChange = onDraftChange,
@@ -462,9 +474,6 @@ private fun ChatInput(
                 maxLines = 5,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(min = 48.dp)
-                    .clip(RoundedCornerShape(20.dp))
-                    .background(MaterialTheme.colorScheme.surfaceVariant)
                     .padding(horizontal = 14.dp, vertical = 12.dp),
                 decorationBox = { inner ->
                     if (draft.isEmpty()) {
