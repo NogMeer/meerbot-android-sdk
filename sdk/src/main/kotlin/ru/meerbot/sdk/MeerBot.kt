@@ -118,6 +118,8 @@ object MeerBot {
         title: String? = null,
         primaryColor: Color? = null,
         onClose: (() -> Unit)? = null,
+        // false — хост показывает чат вкладкой и рисует заголовок сам.
+        showHeader: Boolean = true,
     ) {
         // Контроллер читается на каждой композиции: повторный configure(...) (например,
         // смена ключа) должен подхватываться сразу, а не после перезапуска процесса.
@@ -131,6 +133,7 @@ object MeerBot {
                 title = title,
                 primaryColor = primaryColor,
                 onClose = onClose,
+                showHeader = showHeader,
             )
         }
     }

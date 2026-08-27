@@ -9,6 +9,7 @@ import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.SocketPolicy
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
@@ -170,9 +171,14 @@ class ChatControllerTest {
 
         controller.send("привет")
 
-        await(controller) { it.connectionError != null }
+        // Ждём именно `retryable`, а не баннер ошибки: `handleFailure` ставит ошибку СРАЗУ,
+        // а пометку недоставленного и текст для повтора — только после запроса ленты
+        // (вдруг сервер ответ всё-таки дописал). Между ними целый сетевой круг, и ожидание
+        // по баннеру ловило состояние до его закрытия — тест мигал.
+        await(controller) { it.retryable != null }
         val state = controller.state.value
         assertEquals("привет", state.retryable)
+        assertNotNull(state.connectionError)
         assertTrue(state.messages.first { it.role == "user" }.failed)
         assertTrue(!state.sending)
     }

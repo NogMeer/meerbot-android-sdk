@@ -12,6 +12,8 @@ import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -30,9 +32,11 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
@@ -66,6 +70,15 @@ fun ChatScreen(
     title: String? = null,
     primaryColor: Color? = null,
     onClose: (() -> Unit)? = null,
+    /**
+     * Показывать ли шапку экрана (заголовок + крестик).
+     *
+     * `false` — когда чат открыт как вкладка хоста: там свой заголовок уже есть в его
+     * навигации, и вторая полоса с тем же словом занимает высоту ни за чем. По умолчанию
+     * шапка на месте: SDK чаще открывают модально, и без неё экран остаётся без названия
+     * и без выхода.
+     */
+    showHeader: Boolean = true,
 ) {
     val state by controller.state.collectAsState()
     val listState = rememberLazyListState()
@@ -138,18 +151,64 @@ fun ChatScreen(
         }
     }
 
+    // Лента едет ВМЕСТЕ с клавиатурой, кадр в кадр.
+    //
+    // Поле ввода поднимается на высоту вставки (`imePadding` в `ChatInput`), область списка на
+    // столько же укорачивается, а прокрутка сама по себе не меняется: на выезде нижние
+    // сообщения уходят под поле, на уходе лента остаётся задранной.
+    //
+    // Прокручиваем на РАЗНИЦУ вставки, а не «до последнего элемента»: система отдаёт высоту
+    // на каждом кадре анимации, и сдвиг на дельту оставляет содержимое неподвижным
+    // относительно клавиатуры — то есть плавным. Прыжок «доехать до низа» одним куском (хоть
+    // в начале анимации, хоть в конце) виден именно как рывок.
+    //
+    // Дельта, а не «прижать низ», ещё и потому, что человек может читать историю выше: его
+    // место сохраняется, лента просто не уезжает под клавиатуру.
+    val imeBottom = WindowInsets.ime.getBottom(LocalDensity.current)
+    var previousImeBottom by remember { mutableIntStateOf(imeBottom) }
+    LaunchedEffect(imeBottom) {
+        val delta = imeBottom - previousImeBottom
+        previousImeBottom = imeBottom
+        if (delta == 0) return@LaunchedEffect
+
+        val lastIndex = state.messages.lastIndex
+        if (lastIndex >= 0 && !listState.canScrollForward) {
+            // Лента стоит В САМОМ НИЗУ — держим низ, а не сдвигаем на дельту. У нижней
+            // границы сдвиг упирается в конец списка: часть хода пропадает молча, и на
+            // обратном ходе (клавиатура уходит) полная дельта уносит ленту ВЫШЕ последнего
+            // сообщения. На выезде хватает прижать конец, на уходе низ остаётся низом сам —
+            // список пересчитывает предел прокрутки под выросшую высоту.
+            if (delta > 0) listState.scrollToItem(lastIndex)
+            return@LaunchedEffect
+        }
+
+        listState.scrollBy(delta.toFloat())
+    }
+
     Column(
         modifier = modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background),
     ) {
-        ChatHeader(
-            title = title ?: stringResource(R.string.meerbot_chat_title),
-            onClose = onClose,
-        )
-        HorizontalDivider()
+        if (showHeader) {
+            ChatHeader(
+                title = title ?: stringResource(R.string.meerbot_chat_title),
+                onClose = onClose,
+            )
+            HorizontalDivider()
+        }
 
-        Box(modifier = Modifier.weight(1f)) {
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                // Тап по переписке убирает клавиатуру — в пару к «протянул = закрыл» выше.
+                // Без него выйти из ввода нечем: своей кнопки «Готово» у поля нет, а хост
+                // обычно показывает экран без панели действий. `detectTapGestures` забирает
+                // только тап, прокрутка списка внутри продолжает работать.
+                .pointerInput(keyboardController) {
+                    detectTapGestures(onTap = { keyboardController?.hide() })
+                },
+        ) {
             if (state.messages.isEmpty()) {
                 EmptyState(
                     text = state.greeting
