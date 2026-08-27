@@ -94,6 +94,42 @@ class ChatStoreMergeTest {
         assertEquals(9L, store.lastServerMessageId)
     }
 
+    /**
+     * Регрессия: поток начинается с перевода строки (модель стабильно так отвечает на
+     * передачу менеджеру), сервер хранит строку подрезанной. До правки слияние не узнавало
+     * свой же ответ и клало серверную копию рядом — пользователь видел сообщение дважды.
+     */
+    @Test
+    fun `ответ с переводом строки в начале потока не двоится`() {
+        val store = ChatStore()
+        val placeholder = store.appendAssistantPlaceholder()
+        store.updateAssistantContent(placeholder.id, "\n")
+        store.updateAssistantContent(placeholder.id, "Понимаю, сейчас подключу менеджера.")
+        store.finalizeAssistant(placeholder.id)
+
+        val added = store.mergeServerMessages(
+            listOf(serverMessage(11, text = "Понимаю, сейчас подключу менеджера.")),
+        )
+
+        assertEquals(0, added)
+        assertEquals(1, store.messages.size)
+        assertEquals(11L, store.messages.single().serverId)
+        assertEquals("Понимаю, сейчас подключу менеджера.", store.messages.single().content)
+    }
+
+    /** Хвостовые пробелы потока тоже не должны мешать слиянию. */
+    @Test
+    fun `хвостовой перенос строки не мешает слиянию`() {
+        val store = ChatStore()
+        val placeholder = store.appendAssistantPlaceholder()
+        store.updateAssistantContent(placeholder.id, "Готово")
+        store.updateAssistantContent(placeholder.id, "\n\n")
+        store.finalizeAssistant(placeholder.id)
+
+        assertEquals(0, store.mergeServerMessages(listOf(serverMessage(12, text = "Готово"))))
+        assertEquals(1, store.messages.size)
+    }
+
     @Test
     fun `выход сбрасывает курсор`() {
         val store = ChatStore()

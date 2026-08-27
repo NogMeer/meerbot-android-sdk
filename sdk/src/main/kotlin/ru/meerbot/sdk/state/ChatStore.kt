@@ -110,18 +110,28 @@ class ChatStore {
         return msg
     }
 
+    /**
+     * Дописать кусок потока. Пробелы В НАЧАЛЕ ответа отбрасываются, пока текст пуст.
+     *
+     * Модель начинает ответ с перевода строки чаще, чем кажется (стабильно — на ответе про
+     * передачу менеджеру). Сервер такой ответ сохраняет уже подрезанным, поэтому лишний
+     * `\n` жил только на устройстве: пузырь начинался с пустой строки, а догон ленты не
+     * узнавал в нём свою же строку и клал серверную копию рядом — сообщение двоилось.
+     */
     fun updateAssistantContent(id: String, delta: String) = _state.update { current ->
         current.copy(
             messages = current.messages.map { m ->
-                if (m.id == id) m.copy(content = m.content + delta) else m
+                if (m.id != id) m
+                else m.copy(content = if (m.content.isEmpty()) m.content + delta.trimStart() else m.content + delta)
             }
         )
     }
 
+    /** Ответ дописан: хвостовые пробелы убираем — на сервере строка хранится без них. */
     fun finalizeAssistant(id: String) = _state.update { current ->
         current.copy(
             messages = current.messages.map { m ->
-                if (m.id == id) m.copy(streaming = false) else m
+                if (m.id == id) m.copy(streaming = false, content = m.content.trimEnd()) else m
             }
         )
     }
@@ -180,8 +190,12 @@ class ChatStore {
             val merged = current.messages.toMutableList()
             for (item in items) {
                 if (item.serverId != null && merged.any { it.serverId == item.serverId }) continue
+                // Сравнение по ПОДРЕЗАННОМУ тексту: сервер хранит ответ без крайних пробелов,
+                // а в потоке они приходят (первым чанком часто идёт перевод строки). Точное
+                // равенство роняло слияние в дубль ровно на таких ответах.
                 val localIdx = merged.indexOfLast {
-                    it.serverId == null && it.role == item.role && it.content == item.content
+                    it.serverId == null && it.role == item.role &&
+                        it.content.trim() == item.content.trim()
                 }
                 if (localIdx >= 0) {
                     merged[localIdx] = merged[localIdx].copy(
