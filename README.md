@@ -3,9 +3,23 @@
 Экран чата с ИИ-ассистентом MeerBot внутри вашего Android-приложения: Compose-экран,
 потоковые ответы (SSE), подключение менеджера, догон истории после обрыва связи.
 
-**Статус:** `0.2.4` — работает на собственном канале платформы (`mobile_app`): один
+**Статус:** `0.2.6` — работает на собственном канале платформы (`mobile_app`): один
 ключ, свои эндпоинты, свой диалог на устройство. Не сделано: вложения, Play Integrity,
 cert pinning. См. [Границы](#границы-текущей-версии).
+
+> ### ⚠️ Правки — в `agentbot-platform`, не в репозитории `meerbot-android-sdk`
+>
+> `github.com/NogMeer/meerbot-android-sdk` — **зеркало**. Его содержимое целиком
+> перезаписывается срезом каталога `mobile-sdk-android/` из приватного
+> `agentbot-platform`, откуда его публикует `scripts/release-android-sdk-mirror.sh`.
+>
+> Коммит, сделанный прямо в зеркале, обратно не возвращается: следующий выпуск версии
+> соберёт срез **без него**, а до того момента релиз будет падать на `non-fast-forward`.
+> Push в зеркало ловит страж ([`.github/workflows/mirror-guard.yml`](.github/workflows/mirror-guard.yml))
+> и падает красным.
+>
+> Уже поправили в зеркале? Верните правки в исходник — из чекаута `agentbot-platform`:
+> `scripts/sync-sdk-mirror-back.sh android`.
 
 ---
 
@@ -21,7 +35,7 @@ cert pinning. См. [Границы](#границы-текущей-версии
 
 ```kotlin
 dependencies {
-    implementation("com.github.NogMeer:meerbot-android-sdk:0.2.4")
+    implementation("com.github.NogMeer:meerbot-android-sdk:0.2.6")
 }
 ```
 
