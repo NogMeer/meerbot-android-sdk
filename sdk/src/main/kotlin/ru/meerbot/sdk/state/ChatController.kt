@@ -3,6 +3,7 @@ package ru.meerbot.sdk.state
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
@@ -196,6 +197,11 @@ class ChatController(
             // из лямбды, то есть продолжает перебор — догон честно ходил бы за пятой
             // страницей после первой же исчерпывающей. Поймано тестом на числе запросов.
             for (page in 1..MAX_CATCH_UP_PAGES) {
+                // Отмена проверяется ПЕРЕД каждой страницей: закрытый экран не должен
+                // дочитывать длинную ленту. Уже отправленный запрос при этом долетит —
+                // оборвать его на полпути нечем, да и незачем: ответ просто отбрасывается.
+                // Паритет с iOS (`ChatController.catchUp`).
+                if (!currentCoroutineContext().isActive) return
                 val cursor = store.lastServerMessageId
                 val response = client.history(since = if (cursor > 0) cursor else null, limit = 50)
                 store.setMode(response.mode)

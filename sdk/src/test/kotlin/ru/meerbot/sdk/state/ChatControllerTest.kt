@@ -425,6 +425,12 @@ class ChatControllerCatchUpTest {
         assertNull(controller.state.value.connectionError)
     }
 
+    /**
+     * Гарантия здесь — «после stop() НОВЫЕ циклы догона не начинаются», а не «сеть замирает
+     * в ту же наносекунду». Запрос, отправленный до stop(), долетает, и снятая сразу после
+     * stop() отметка его не включала бы — тест мигал на CI. Поэтому отметка снимается после
+     * паузы, достаточной, чтобы всё уже отправленное дошло, а проверяется следующий интервал.
+     */
     @Test
     fun `stop останавливает догон`() {
         val controller = started()
@@ -432,6 +438,7 @@ class ChatControllerCatchUpTest {
         Thread.sleep(120)
 
         controller.stop()
+        Thread.sleep(150)
         val afterStop = server.requestCount
         Thread.sleep(200)
 
