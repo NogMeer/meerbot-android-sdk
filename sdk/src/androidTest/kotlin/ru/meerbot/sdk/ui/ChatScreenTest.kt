@@ -2,6 +2,9 @@ package ru.meerbot.sdk.ui
 
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.hasScrollAction
+import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.junit4.ComposeContentTestRule
 import androidx.compose.ui.test.junit4.createComposeRule
@@ -106,6 +109,7 @@ class ChatScreenTest {
         showScreen()
 
         compose.awaitText("мы на связи")
+        compose.scrollToText("мы на связи")
         compose.onNodeWithText("мы на связи", substring = true).assertIsDisplayed()
     }
 
@@ -128,7 +132,11 @@ class ChatScreenTest {
         compose.onNodeWithContentDescription(str(R.string.meerbot_send)).performClick()
 
         compose.awaitText("Готово")
-        compose.onNodeWithText("привет").assertIsDisplayed()
+        // Реплика пользователя проверяется на СУЩЕСТВОВАНИЕ, а не на видимость: к этому
+        // моменту экран уже прокручен к свежему ответу, и «привет» законно уехал за верхний
+        // край. Требовать видимости обоих сразу — требовать того, чего продукт не обещает;
+        // подкрутить ленту обратно тоже нельзя, автоскролл тут же вернёт её вниз.
+        compose.onNodeWithText("привет").assertExists()
     }
 
     @Test
@@ -148,6 +156,7 @@ class ChatScreenTest {
         compose.onNodeWithContentDescription(str(R.string.meerbot_send)).performClick()
 
         compose.awaitText(str(R.string.meerbot_retry))
+        compose.scrollToText(str(R.string.meerbot_not_delivered))
         compose.onNodeWithText(str(R.string.meerbot_not_delivered)).assertIsDisplayed()
     }
 
@@ -163,9 +172,27 @@ class ChatScreenTest {
     }
 }
 
-/** Дождаться появления текста: сеть здесь настоящая, ожидание по семантике надёжнее пауз. */
+/**
+ * Дождаться появления текста: сеть здесь настоящая, ожидание по семантике надёжнее пауз.
+ *
+ * ВАЖНО: `awaitText` says «узел ЕСТЬ», а не «узел ВИДЕН». Экран автоскроллится к последнему
+ * сообщению, поэтому проверяемая реплика к моменту проверки успевает уехать за верхний край —
+ * `assertIsDisplayed()` без `performScrollTo()` падал примерно на каждом втором прогоне, и
+ * каждый раз на разном тесте. В CI это не всплывало: инструментальные тесты там не гоняются.
+ */
 private fun ComposeContentTestRule.awaitText(text: String, timeoutMs: Long = 10_000) {
     waitUntil(timeoutMs) {
         onAllNodesWithText(text, substring = true).fetchSemanticsNodes().isNotEmpty()
     }
+}
+
+/**
+ * Подкрутить ленту к сообщению.
+ *
+ * Лента — `LazyColumn`, и `performScrollTo()` на её элементе не работает: за пределами
+ * вьюпорта элемента просто нет в композиции. Скроллить обязан САМ список — отсюда
+ * `performScrollToNode` на узле со скролл-действием.
+ */
+private fun ComposeContentTestRule.scrollToText(text: String) {
+    onNode(hasScrollAction()).performScrollToNode(hasText(text, substring = true))
 }
