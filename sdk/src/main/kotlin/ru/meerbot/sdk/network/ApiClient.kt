@@ -144,9 +144,6 @@ class ApiClient(
     var identityStatus: IdentityStatus = IdentityStatus.NotProvided
         private set
 
-    /** Токен идентичности, с которым уйдёт следующее рукопожатие. */
-    internal val currentIdentityToken: String? get() = identityToken
-
     /**
      * Подписанный бэкендом интегратора токен идентичности. Следующее рукопожатие уйдёт с ним;
      * текущая сессия сбрасывается, иначе identity подхватилась бы только через 15 минут.

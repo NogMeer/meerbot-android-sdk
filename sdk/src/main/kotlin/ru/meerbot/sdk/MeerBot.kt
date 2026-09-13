@@ -15,6 +15,7 @@ import kotlinx.coroutines.SupervisorJob
 import okhttp3.OkHttpClient
 import ru.meerbot.sdk.network.ApiClient
 import ru.meerbot.sdk.network.IdentityStatus
+import ru.meerbot.sdk.network.IdentitySubject
 import ru.meerbot.sdk.network.LogoutFlagStore
 import ru.meerbot.sdk.network.MeerBotConfiguration
 import ru.meerbot.sdk.state.ChatController
@@ -69,6 +70,12 @@ object MeerBot {
     private var pendingLogout = false
 
     /**
+     * Чья identity применена к текущему клиенту: `sub` последнего токена (у нечитаемого —
+     * сама строка). `null` — токена нет или был выход. По нему решается, чистить ли ленту.
+     */
+    private var appliedIdentityKey: String? = null
+
+    /**
      * Настроить SDK.
      *
      * @param apiKey `pk_live_*` мобильного приложения из кабинета: Бот → Каналы →
@@ -117,6 +124,8 @@ object MeerBot {
         // ни разу не открыл, — это перекосило бы аналитику владельца и его лимиты.
         // Кому нужен прогрев — preconnect().
 
+        // Новый клиент создан без токена: ключ прежнего клиента к нему не относится.
+        appliedIdentityKey = IdentitySubject.key(pendingIdentityToken)
         pendingIdentityToken?.let { token ->
             pendingIdentityToken = null
             apiClient.setIdentityToken(token)
@@ -172,8 +181,9 @@ object MeerBot {
      * к данным клиента ему недоступны. Вызов до `configure(...)` запоминается и применяется
      * на первом рукопожатии.
      *
-     * Смена токена на другой очищает ленту на экране: она подтянется с сервера уже под новой
-     * identity. Повторный вызов с тем же токеном ничего не делает.
+     * Токен уходит в следующее рукопожатие при каждом вызове. Ленту на экране очищает только
+     * токен ДРУГОГО пользователя (другой `sub`): свежий токен того же пользователя, выпущенный
+     * на очередной вход в чат, ленту не трогает.
      *
      * `null` — НАСТОЯЩИЙ выход пользователя из аккаунта, и звать его нужно только тогда, а не
      * «на всякий случай» при пустом токене. С 0.2.9 выход отвязывает устройство на сервере
@@ -190,16 +200,12 @@ object MeerBot {
             pendingIdentityToken = token
             return
         }
-        if (token == null) {
-            // Выход — всегда, даже если токена в этом процессе не было: связь могла остаться
-            // от прошлого запуска, и живая сессия открыла бы переписку прежнего пользователя.
-            apiClient.logout()
-            controller?.resetForIdentityChange()
-            return
-        }
-        if (token == apiClient.currentIdentityToken) return
-        apiClient.setIdentityToken(token)
-        controller?.resetForIdentityChange()
+        // Выход чистит ленту всегда (связь могла остаться от прошлого запуска), токен — только
+        // при смене человека. Решение и его причины — IdentitySubject.shouldResetFeed.
+        val resetFeed = IdentitySubject.shouldResetFeed(appliedIdentityKey, token)
+        appliedIdentityKey = IdentitySubject.key(token)
+        if (token == null) apiClient.logout() else apiClient.setIdentityToken(token)
+        if (resetFeed) controller?.resetForIdentityChange()
     }
 
     /** Что сервер сделал с identity на последнем рукопожатии. */
@@ -257,6 +263,7 @@ object MeerBot {
         visitorUuid = null
         pendingIdentityToken = null
         pendingLogout = false
+        appliedIdentityKey = null
         prefs?.edit()?.clear()?.apply()
     }
 
