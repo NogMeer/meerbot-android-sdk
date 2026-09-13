@@ -218,8 +218,9 @@ class ChatStore {
      *      добавляем второй: иначе своё же сообщение пользователь увидит дважды. Идём от
      *      новых к старым, чтобы эхо забрала самая новая строка с этим текстом. Стримящийся
      *      пузырь не промоутим: он ещё дописывается, и серверная строка с тем же текстом — не
-     *      его окончательная версия. Промоут недоставленного снимает и текст «Повторить»:
-     *      сообщение дошло, повтор отправил бы его второй раз.
+     *      его окончательная версия. После прохода текст «Повторить» (если он был) берётся у
+     *      последней ещё недоставленной строки, а без таких снимается: промоутнутое сообщение
+     *      дошло, повтор отправил бы его второй раз.
      *
      * Проход 2, по порядку страницы — вставить остальное на своё место (см. [insertionIndex]),
      * а не в конец: стартовая история, пришедшая после отправки, старше отправленного
@@ -235,7 +236,6 @@ class ChatStore {
         _state.update { current ->
             val merged = current.messages.toMutableList()
             val recognized = HashSet<Int>()
-            var retryable = current.retryable
             for (index in items.indices.reversed()) {
                 val item = items[index]
                 if (item.serverId != null && merged.any { it.serverId == item.serverId }) {
@@ -244,13 +244,16 @@ class ChatStore {
                 }
                 val localIdx = indexOfLocalTwin(merged, item)
                 if (localIdx >= 0) {
-                    val local = merged[localIdx]
-                    if (local.failed && local.role == "user" && retryable?.trim() == local.content.trim()) {
-                        retryable = null
-                    }
-                    merged[localIdx] = local.copy(serverId = item.serverId, failed = false)
+                    merged[localIdx] = merged[localIdx].copy(serverId = item.serverId, failed = false)
                     recognized += index
                 }
+            }
+            // «Повторить» следует за последней ещё недоставленной строкой, а если таких не
+            // осталось — снимается: повтор отправил бы доставленное второй раз. Сверка по тексту
+            // здесь не годится — эхо более нового из двух недоставленных снимало бы кнопку и у
+            // старого, который так и не дошёл. Паритет с iOS `mergeServerPage`.
+            val retryable = current.retryable?.let {
+                merged.lastOrNull { m -> m.failed && m.role == "user" }?.content
             }
 
             // Счётчик — локальный: `update` может перезапустить лямбду при гонке записи.

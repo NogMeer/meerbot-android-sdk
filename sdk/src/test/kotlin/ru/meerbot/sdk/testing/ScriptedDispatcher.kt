@@ -59,6 +59,9 @@ class ScriptedDispatcher : Dispatcher() {
     /** Сколько запросов истории пришло и ещё не забрано `awaitHistory`. */
     fun historyArrivalCount(): Int = historyArrivals.size
 
+    /** Сколько запросов потока пришло и ещё не забрано `awaitStream`. */
+    fun streamArrivalCount(): Int = streamArrivals.size
+
     fun clearArrivals() {
         registerArrivals.clear()
         historyArrivals.clear()

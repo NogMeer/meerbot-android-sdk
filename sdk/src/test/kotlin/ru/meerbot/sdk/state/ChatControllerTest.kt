@@ -257,6 +257,71 @@ class ChatControllerTest {
         assertEquals(1, state.messages.count { it.role == "user" })
     }
 
+    /**
+     * Сообщение ушло, хотя отправка кончилась ошибкой: догон узнал эхо и снял пометку. «Повторить»
+     * по устаревшему состоянию (свой UI хоста) раньше падал в `send(text)` и слал доставленное
+     * второй раз — дубль в треде и второй платный ответ модели.
+     */
+    @Test
+    fun `повтор доставленного по эху сообщения ничего не отправляет`() {
+        val dispatcher = ScriptedDispatcher().also { server.dispatcher = it }
+        val api = apiClient()
+        val controller = controller(api)
+        controller.start()
+        await(controller) { it.ready }
+        api.rememberConversationId(3)
+        dispatcher.streamFallback = { ScriptedDispatcher.error(502, "bad_gateway") }
+        controller.send("привет")
+        await(controller) { it.retryable != null }
+
+        dispatcher.historyFallback = {
+            ScriptedDispatcher.history(messages = """{"id":7,"role":"user","content":"привет","createdAt":"${iso()}"}""")
+        }
+        controller.refresh()
+        await(controller) { s -> s.messages.single { it.role == "user" }.serverId == 7L }
+        assertNull(controller.state.value.retryable)
+
+        dispatcher.clearArrivals()
+        controller.store.setRetryable("привет")
+        controller.retry()
+
+        val state = controller.state.value
+        assertTrue(!state.sending)
+        assertNull(state.retryable)
+        assertEquals(1, state.messages.count { it.role == "user" })
+        controller.stop()
+        awaitControllerIdle()
+        assertEquals(0, dispatcher.streamArrivalCount())
+    }
+
+    /** Недоставленное повторяется ровно один раз, двойной тап второй отправки не делает. */
+    @Test
+    fun `повтор недоставленного отправляет его ровно один раз`() {
+        val dispatcher = ScriptedDispatcher().also { server.dispatcher = it }
+        val controller = controller()
+        controller.start()
+        await(controller) { it.ready }
+        dispatcher.streamFallback = { ScriptedDispatcher.error(502, "bad_gateway") }
+        controller.send("привет")
+        await(controller) { it.retryable != null }
+
+        dispatcher.clearArrivals()
+        val gate = dispatcher.gateNextStream(ScriptedDispatcher.sse(answerStream))
+        controller.retry()
+        controller.retry()
+        assertEquals("привет", JSONObject(dispatcher.awaitStream().body.readUtf8()).getString("message"))
+        gate.countDown()
+        await(controller) { s -> !s.sending && s.messages.any { it.content == "Здравствуйте" } }
+        controller.stop()
+        awaitControllerIdle()
+
+        assertEquals(0, dispatcher.streamArrivalCount())
+        val state = controller.state.value
+        assertEquals(1, state.messages.count { it.role == "user" })
+        assertTrue(state.messages.none { it.failed })
+        assertNull(state.retryable)
+    }
+
     @Test
     fun `серверная история заменяет ленту после обрыва`() {
         val controller = started()

@@ -137,20 +137,23 @@ class ChatController(
         run(trimmed, userMessage.id)
     }
 
-    /** Повторить последнюю неудачную отправку. */
+    /**
+     * Повторить последнюю неудачную отправку.
+     *
+     * Повторяется СТРОКА ленты, помеченная недоставленной, и её же текст. Нет такой строки —
+     * повторять нечего: пометку снимает только слияние, узнавшее сообщение на сервере, и
+     * устаревший текст «Повторить» просто снимается. Раньше здесь стоял запасной `send(text)`,
+     * и повтор после такого слияния отправлял уже доставленное сообщение второй раз — с дублем
+     * в треде и вторым платным ответом модели. Паритет с iOS.
+     */
     @MainThread
     fun retry() {
-        val text = store.state.value.retryable ?: return
+        if (store.state.value.retryable == null) return
         store.setRetryable(null)
-        // Прошлое сообщение осталось в ленте помеченным как недоставленное — переиспользуем его.
-        val failed = store.messages.lastOrNull { it.failed && it.role == "user" }
-        if (failed != null) {
-            store.setFailed(failed.id, false)
-            store.markResent(failed.id)
-            run(text, failed.id)
-        } else {
-            send(text)
-        }
+        val failed = store.messages.lastOrNull { it.failed && it.role == "user" } ?: return
+        store.setFailed(failed.id, false)
+        store.markResent(failed.id)
+        run(failed.content, failed.id)
     }
 
     /**

@@ -489,9 +489,114 @@ class ApiClientTest {
         assertFalse(flag.pending)
     }
 
+    // ─── Публичный setIdentityToken: флаг выхода, как у identify (паритет с iOS) ─────────────
+
+    @Test
+    fun `setIdentityToken с другим sub ставит флаг выхода`() = runBlocking {
+        server.enqueue(registerResponse(identityStatus = "verified", unlinked = true))
+        server.enqueue(registerResponse(jwt = "jwt-2", identityStatus = "rejected", unlinked = true))
+        val flag = InMemoryLogoutFlagStore()
+        val api = client(flag)
+        val tokenB = Jwt.withSub("user-B")
+
+        api.setIdentityToken(Jwt.withSub("user-A"))
+        // Первый токен экземпляра: кто был связан с устройством до него, неизвестно.
+        assertTrue(flag.pending)
+        api.openSession()
+        assertFalse(flag.pending)
+        api.rememberConversationId(77)
+
+        api.setIdentityToken(tokenB)
+
+        assertTrue(flag.pending)
+        assertNull(api.conversationId)
+        assertEquals(IdentityStatus.NotProvided, api.identityStatus)
+        api.openSession()
+        assertTrue(registerBody().getBoolean("logout"))
+        val body = registerBody()
+        assertTrue(body.getBoolean("logout"))
+        assertEquals(tokenB, body.getString("identityToken"))
+        assertFalse(flag.pending)
+    }
+
+    @Test
+    fun `setIdentityToken со свежим токеном того же sub выход не ставит и диалог не сбрасывает`() = runBlocking {
+        server.enqueue(registerResponse(identityStatus = "verified", unlinked = true))
+        server.enqueue(registerResponse(jwt = "jwt-2", identityStatus = "verified"))
+        val flag = InMemoryLogoutFlagStore()
+        val api = client(flag)
+        api.setIdentityToken(Jwt.withSub("user-A", iat = 1))
+        api.validToken()
+        assertFalse(flag.pending)
+        api.rememberConversationId(77)
+        val fresh = Jwt.withSub("user-A", iat = 2)
+
+        api.setIdentityToken(fresh)
+
+        assertFalse(flag.pending)
+        assertEquals(77L, api.conversationId)
+        assertEquals("jwt-2", api.validToken())
+        registerBody()
+        val body = registerBody()
+        assertFalse(body.has("logout"))
+        assertEquals(fresh, body.getString("identityToken"))
+    }
+
+    /** Нечитаемый `sub` — не «тот же человек», даже если строка токена та же (как identify). */
+    @Test
+    fun `setIdentityToken с нечитаемым sub ставит флаг выхода`() = runBlocking {
+        server.enqueue(registerResponse(unlinked = true))
+        val flag = InMemoryLogoutFlagStore()
+        val api = client(flag)
+        api.setIdentityToken("opaque")
+        api.openSession()
+        assertFalse(flag.pending)
+
+        api.setIdentityToken("opaque")
+
+        assertTrue(flag.pending)
+    }
+
+    @Test
+    fun `setIdentityToken null сбрасывает диалог, но выход не ставит`() = runBlocking {
+        server.enqueue(registerResponse(identityStatus = "verified", unlinked = true))
+        val flag = InMemoryLogoutFlagStore()
+        val api = client(flag)
+        api.setIdentityToken(Jwt.withSub("user-A"))
+        api.openSession()
+        api.rememberConversationId(77)
+
+        api.setIdentityToken(null)
+
+        assertFalse(flag.pending)
+        assertNull(api.conversationId)
+        assertEquals(IdentityStatus.NotProvided, api.identityStatus)
+    }
+
+    /** Клиент хоста из публичного конструктора: флаг в памяти, но в рукопожатие он уходит. */
+    @Test
+    fun `клиент из публичного конструктора шлёт выход после смены токена`() = runBlocking {
+        server.enqueue(registerResponse(unlinked = true))
+        val api = ApiClient(
+            MeerBotConfiguration(
+                apiKey = "pk_live_mobile",
+                baseUrl = server.url("/").toString().trimEnd('/'),
+                sdkVersion = "0.2.0-test",
+            ),
+            VISITOR,
+            INSTALLATION,
+        )
+
+        api.setIdentityToken(Jwt.withSub("user-A"))
+        api.openSession()
+
+        assertTrue(registerBody().getBoolean("logout"))
+    }
+
     @Test
     fun `свежий токен того же пользователя выход не шлёт и диалог не сбрасывает`() = runBlocking {
-        server.enqueue(registerResponse(identityStatus = "verified"))
+        // `unlinked` снимает флаг, поставленный первым токеном экземпляра.
+        server.enqueue(registerResponse(identityStatus = "verified", unlinked = true))
         server.enqueue(registerResponse(jwt = "jwt-2", identityStatus = "verified"))
         val flag = InMemoryLogoutFlagStore()
         val api = client(flag)

@@ -160,19 +160,44 @@ class ApiClient internal constructor(
      * текущая сессия сбрасывается, иначе identity подхватилась бы только через 15 минут.
      *
      * `null` здесь — только «токена нет», устройство от пользователя НЕ отвязывается: сервер
-     * держит связь, пока не придёт явный выход (`MeerBot.identify(null)`).
+     * держит связь, пока не придёт явный выход (`MeerBot.identify(null)`). Диалог, курсор и
+     * статус identity сбрасываются, флаг выхода не ставится.
      *
-     * Диалог, курсор и статус identity сбрасываются: они описывают прежнюю identity (паритет с
-     * iOS — любая смена, кроме свежего токена того же человека).
+     * Смена человека определяется по `sub` против токена, заданного в ЭТОМ экземпляре, тем же
+     * правилом, что у `MeerBot.identify` ([IdentitySubject.change]):
+     * - свежий токен того же `sub` (оба читаются и совпали) — токен уходит в следующее
+     *   рукопожатие, диалог и курсор остаются;
+     * - любой другой токен — другой `sub`, `sub`, который не читается, или первый токен
+     *   экземпляра (кто был связан с устройством до него, экземпляр не знает) — выход плюс вход:
+     *   ставится флаг выхода, и следующее рукопожатие несёт `logout: true` с новым токеном, даже
+     *   если токен нового сервер не примет. Диалог, курсор и статус сбрасываются. Лишней
+     *   отставки флаг не даёт: тот же `sub` с подписанным токеном и анонимную строку сервер
+     *   оставляет как есть. Паритет с iOS `APIClient.setIdentityToken`.
+     *
+     * Клиент, собранный публичным конструктором, держит флаг выхода в памяти процесса: убитый
+     * до рукопожатия процесс его забудет. Флаг на диске и сравнение с пользователем прошлого
+     * запуска — у `MeerBot.identify`.
      */
     fun setIdentityToken(token: String?) {
         synchronized(sessionLock) {
-            identityToken = token
-            generation++
-            invalidateToken()
-            conversationId = null
-            lastMessageId = null
-            identityStatus = IdentityStatus.NotProvided
+            if (token == null) {
+                identityToken = null
+                generation++
+                invalidateToken()
+                conversationId = null
+                lastMessageId = null
+                identityStatus = IdentityStatus.NotProvided
+                return
+            }
+            // Решение и применение — под одним замком (он реентрантный): два параллельных вызова
+            // иначе сравнили бы свои токены с одним и тем же прежним.
+            val subject = IdentitySubject.of(token)
+            val change = IdentitySubject.change(
+                previousHash = identityToken?.let { IdentitySubject.hash(installationId, IdentitySubject.key(it)) },
+                newHash = IdentitySubject.hash(installationId, subject ?: token),
+                newSubjectReadable = subject != null,
+            )
+            if (change == IdentityChange.Refresh) refreshIdentityToken(token) else switchIdentity(token)
         }
     }
 

@@ -287,6 +287,38 @@ class ChatStoreMergeTest {
         assertNull(store.state.value.retryable)
     }
 
+    /**
+     * Два недоставленных, дошло новое. Сверка по тексту снимала «Повторить» целиком, и старое
+     * сообщение оставалось недоставленным без кнопки. Теперь повтор переходит к нему (как iOS).
+     */
+    @Test
+    fun `эхо нового из двух недоставленных оставляет повтор старому`() {
+        val store = ChatStore()
+        val older = store.appendUserMessage("первое")
+        store.setFailed(older.id, true)
+        val newer = store.appendUserMessage("второе")
+        store.setFailed(newer.id, true)
+        store.setRetryable("второе")
+
+        store.mergeServerMessages(listOf(serverMessage(7, role = "user", text = "второе")))
+
+        assertTrue(store.messages.single { it.id == older.id }.failed)
+        assertFalse(store.messages.single { it.id == newer.id }.failed)
+        assertEquals("первое", store.state.value.retryable)
+    }
+
+    /** Слияние «Повторить» не выдумывает: без текста повтора его нет и после. */
+    @Test
+    fun `слияние не ставит повтор, которого не было`() {
+        val store = ChatStore()
+        val local = store.appendUserMessage("привет")
+        store.setFailed(local.id, true)
+
+        store.mergeServerMessages(listOf(serverMessage(6, text = "старый ответ", at = yesterday)))
+
+        assertNull(store.state.value.retryable)
+    }
+
     /** Два одинаковых неотправленных сообщения: эхо достаётся каждому по порядку, без дублей. */
     @Test
     fun `одинаковые сообщения промоутятся по порядку`() {
