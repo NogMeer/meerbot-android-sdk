@@ -161,23 +161,42 @@ class ChatStore {
         current.copy(messages = current.messages.filterNot { it.id == id && it.content.isEmpty() })
     }
 
+    /** Убрать сообщение из ленты (недописанный пузырь, когда серверная версия ответа уже в ней). */
+    internal fun removeMessage(id: String) = _state.update { current ->
+        current.copy(messages = current.messages.filterNot { it.id == id })
+    }
+
     val lastServerMessageId: Long get() = _state.value.lastServerMessageId
 
-    /** Заменить всю ленту (догон истории с сервера — сервер источник правды). */
+    /**
+     * Заменить всю ленту.
+     *
+     * Стирает и неподтверждённые сообщения (отправляемое, недоставленное). SDK сам этот метод
+     * не зовёт: история вливается через [mergeServerMessages], иначе ответ истории, пришедший
+     * после отправки, убирал бы отправленное сообщение с экрана.
+     */
     fun replaceAll(items: List<ChatMessage>) = _state.update {
         it.copy(messages = items, lastServerMessageId = bumpCursor(it.lastServerMessageId, items))
     }
 
     /**
-     * Влить серверную страницу в ленту. Идемпотентно по `serverId`. Зеркало iOS
-     * `ChatStore.mergeServerMessages`.
+     * Влить серверную страницу в ленту — и догон `since`, и полную историю (старт экрана,
+     * сверка после обрыва и рестарта сервера). Идемпотентно по `serverId`; неподтверждённые
+     * локальные сообщения не пропадают никогда. Зеркало iOS `ChatStore.mergeServerMessages`.
      *
-     * Три случая, и порядок между ними важен:
-     *   1. `serverId` уже в ленте — пропускаем (повторная страница догона — это норма);
+     * Два прохода, и порядок между ними важен.
+     *
+     * Проход 1, от новых строк страницы к старым — узнать своё:
+     *   1. `serverId` уже в ленте — пропускаем (страница пришла повторно, это норма догона);
      *   2. есть локальный двойник (тот же `role` и текст, ещё без серверного id) — ПРОМОУТИМ
-     *      его, а не добавляем второй: иначе своё же сообщение пользователь увидит дважды,
-     *      как только догон принесёт его с сервера;
-     *   3. иначе — новое сообщение, добавляем в конец.
+     *      его, а не добавляем второй: иначе своё же сообщение пользователь увидит дважды.
+     *      Идём от новых к старым, чтобы эхо забрала самая новая строка с этим текстом, а не
+     *      вчерашнее «ок» из полной истории. Стримящийся пузырь не промоутим: он ещё
+     *      дописывается, и серверная строка с тем же текстом — не его окончательная версия.
+     *
+     * Проход 2, по порядку страницы — вставить остальное на своё место (см. [insertionIndex]),
+     * а не в конец: стартовая история, пришедшая после отправки, старше отправленного
+     * сообщения и должна встать над ним.
      *
      * Курсор двигается ВСЕГДА, даже если вся страница пропущена: иначе следующий догон
      * запросил бы те же строки и цикл никогда бы не сдвинулся.
@@ -188,16 +207,30 @@ class ChatStore {
         var added = 0
         _state.update { current ->
             val merged = current.messages.toMutableList()
-            for (item in items) {
-                if (item.serverId != null && merged.any { it.serverId == item.serverId }) continue
-                val localIdx = indexOfLocalTwin(merged, item)
-                if (localIdx >= 0) {
-                    merged[localIdx] = promoted(merged[localIdx], item)
+            val recognized = HashSet<Int>()
+            for (index in items.indices.reversed()) {
+                val item = items[index]
+                if (item.serverId != null && merged.any { it.serverId == item.serverId }) {
+                    recognized += index
                     continue
                 }
-                merged += item
-                added++
+                val localIdx = indexOfLocalTwin(merged, item)
+                if (localIdx >= 0) {
+                    merged[localIdx] = merged[localIdx].copy(serverId = item.serverId, failed = false)
+                    recognized += index
+                }
             }
+
+            // Счётчик — локальный: `update` может перезапустить лямбду при гонке записи.
+            var inserted = 0
+            for ((index, item) in items.withIndex()) {
+                if (index in recognized) continue
+                // Одна и та же строка дважды в странице.
+                if (item.serverId != null && merged.any { it.serverId == item.serverId }) continue
+                merged.add(insertionIndex(merged, item), item)
+                inserted++
+            }
+            added = inserted
             current.copy(
                 messages = merged,
                 lastServerMessageId = bumpCursor(current.lastServerMessageId, items),
@@ -207,76 +240,8 @@ class ChatStore {
     }
 
     /**
-     * Применить хвост треда с сервера (старт экрана, обрыв потока, плановый рестарт сервера).
-     *
-     * Серверные строки — источник правды, но ЛОКАЛЬНЫЕ (ещё без `serverId`) не выбрасываются:
-     * сообщение, отправленное до прихода стартовой истории, ещё отправляется или ждёт
-     * «Повторить», а снимок, запрошенный раньше отправки, о нём не знает. Раньше здесь была
-     * замена ленты целиком, и такое сообщение пропадало с экрана.
-     *
-     * Дедупликация — то же правило, что у [mergeServerMessages]: строка снимка с локальным
-     * двойником промоутит его (id пузыря сохраняется, дубля нет). Одно ограничение сверху:
-     * двойником бывает только строка НОВЕЕ курсора. Всё, что не новее, лента уже видела, и
-     * совпадение текста со старой строкой («привет» вчера и «привет» сегодня) — не эхо. Догону
-     * это ограничение не нужно: его страница по построению новее курсора.
-     *
-     * Непромоутированная локальная строка встаёт сразу за серверной строкой, за которой стояла
-     * в ленте (догон тоже кладёт новое после неё), не было такой в снимке — перед ближайшей
-     * следующей, нет и её — в конец.
-     *
-     * @param supersededLocalId локальная строка, которую снимок заменяет по смыслу, а не по
-     *   тексту: обрывок ответа, дописанного сервером целиком. Убирается в том же обновлении
-     *   состояния, чтобы экран не увидел кадр без ответа вовсе.
-     */
-    internal fun mergeServerSnapshot(items: List<ChatMessage>, supersededLocalId: String? = null) =
-        _state.update { current ->
-            val feed = current.messages.filterNot { it.id == supersededLocalId }
-            val snapshot = items.toMutableList()
-            val candidates = feed.filter { it.serverId == null }.toMutableList()
-            val promotedIds = HashSet<String>()
-            // С конца: последнее эхо достаётся последнему двойнику, порядок пузырей сохраняется.
-            for (i in snapshot.indices.reversed()) {
-                val item = snapshot[i]
-                val serverId = item.serverId ?: continue
-                if (serverId <= current.lastServerMessageId) continue
-                val idx = indexOfLocalTwin(candidates, item)
-                if (idx < 0) continue
-                val local = candidates.removeAt(idx)
-                snapshot[i] = promoted(local, item)
-                promotedIds += local.id
-            }
-
-            val slotByServerId = HashMap<Long, Int>()
-            val slotByLocalId = HashMap<String, Int>()
-            snapshot.forEachIndexed { slot, m ->
-                m.serverId?.let { slotByServerId[it] = slot }
-                if (m.id in promotedIds) slotByLocalId[m.id] = slot
-            }
-            fun slotOf(m: ChatMessage): Int? =
-                m.serverId?.let { slotByServerId[it] } ?: slotByLocalId[m.id]
-
-            val pendingBySlot = HashMap<Int, MutableList<ChatMessage>>()
-            feed.forEachIndexed { pos, m ->
-                if (m.serverId != null || m.id in promotedIds) return@forEachIndexed
-                val slot = (pos - 1 downTo 0).firstNotNullOfOrNull { slotOf(feed[it]) }?.plus(1)
-                    ?: (pos + 1 until feed.size).firstNotNullOfOrNull { slotOf(feed[it]) }
-                    ?: snapshot.size
-                pendingBySlot.getOrPut(slot) { mutableListOf() } += m
-            }
-
-            val merged = ArrayList<ChatMessage>(snapshot.size + candidates.size)
-            for (slot in 0..snapshot.size) {
-                pendingBySlot[slot]?.let { merged += it }
-                if (slot < snapshot.size) merged += snapshot[slot]
-            }
-            current.copy(
-                messages = merged,
-                lastServerMessageId = bumpCursor(current.lastServerMessageId, items),
-            )
-        }
-
-    /**
-     * Локальный двойник серверной строки: тот же `role` и текст, ещё без серверного id.
+     * Локальный двойник серверной строки: тот же `role` и текст, ещё без серверного id, не
+     * стримится.
      *
      * Сравнение по ПОДРЕЗАННОМУ тексту: сервер хранит ответ без крайних пробелов, а в потоке
      * они приходят (первым чанком часто идёт перевод строки). Точное равенство роняло слияние
@@ -284,11 +249,27 @@ class ChatStore {
      */
     private fun indexOfLocalTwin(messages: List<ChatMessage>, item: ChatMessage): Int =
         messages.indexOfLast {
-            it.serverId == null && it.role == item.role && it.content.trim() == item.content.trim()
+            it.serverId == null && !it.streaming && it.role == item.role &&
+                it.content.trim() == item.content.trim()
         }
 
-    private fun promoted(local: ChatMessage, item: ChatMessage): ChatMessage =
-        local.copy(serverId = item.serverId, failed = false, streaming = false)
+    /**
+     * Место новой серверной строки — сразу после последней строки ленты, которая раньше неё.
+     *
+     * Между серверными строками порядок задаёт `serverId` (он растёт на сервере). С
+     * неподтверждёнными сравнивать можно только время: серверный `createdAt` против часов
+     * устройства. Расхождение часов на секунды может переставить соседей — ответ менеджера,
+     * пришедший в те же секунды, что и недоставленное сообщение, — но ничего не теряет и не
+     * двоит. Главный случай (стартовая история старше отправки на минуты и дни) оно не задевает.
+     */
+    private fun insertionIndex(messages: List<ChatMessage>, item: ChatMessage): Int {
+        val itemId = item.serverId
+        return messages.indexOfLast { existing ->
+            val existingId = existing.serverId
+            if (existingId != null && itemId != null) existingId < itemId
+            else existing.timestamp <= item.timestamp
+        } + 1
+    }
 
     /** Курсор только растёт: страница старее текущего значения не имеет права его откатить. */
     private fun bumpCursor(current: Long, items: List<ChatMessage>): Long =

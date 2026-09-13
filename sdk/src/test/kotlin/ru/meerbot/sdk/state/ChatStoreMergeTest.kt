@@ -15,11 +15,20 @@ import org.junit.Test
  */
 class ChatStoreMergeTest {
 
-    private fun serverMessage(id: Long, role: String = "assistant", text: String) = ChatMessage(
+    /** Строка «вчерашней» истории — заведомо старше всего, что появилось на устройстве. */
+    private val yesterday = System.currentTimeMillis() - 24 * 60 * 60 * 1000L
+
+    private fun serverMessage(
+        id: Long,
+        role: String = "assistant",
+        text: String,
+        at: Long = System.currentTimeMillis(),
+    ) = ChatMessage(
         role = role,
         author = if (role == "assistant") "manager" else null,
         authorName = if (role == "assistant") "Роман" else null,
         content = text,
+        timestamp = at,
         serverId = id,
     )
 
@@ -131,19 +140,20 @@ class ChatStoreMergeTest {
         assertEquals(1, store.messages.size)
     }
 
-    // ─── Хвост треда (старт, обрыв, рестарт сервера) ──────────────────────────────────────
+    // ─── Неподтверждённые сообщения и полная история ─────────────────────────────────────
 
-    private fun snapshot(vararg ids: Long) = ids.map { serverMessage(it, text = "строка $it") }
-
-    /** Человек написал до прихода стартовой истории: снимок о сообщении не знает. */
+    /** Стартовая история пришла после отправки: её строки старше ждущего сообщения. */
     @Test
-    fun `снимок сохраняет отправляемое сообщение и стримящийся ответ`() {
+    fun `страница старее ждущего сообщения встаёт перед ним`() {
         val store = ChatStore()
         val local = store.appendUserMessage("привет")
         val placeholder = store.appendAssistantPlaceholder()
 
-        store.mergeServerSnapshot(
-            listOf(serverMessage(5, role = "user", text = "старый вопрос"), serverMessage(6, text = "старый ответ")),
+        store.mergeServerMessages(
+            listOf(
+                serverMessage(5, role = "user", text = "старый вопрос", at = yesterday),
+                serverMessage(6, text = "старый ответ", at = yesterday + 1_000),
+            ),
         )
 
         assertEquals(listOf("старый вопрос", "старый ответ", "привет", ""), store.messages.map { it.content })
@@ -154,29 +164,56 @@ class ChatStoreMergeTest {
     }
 
     @Test
-    fun `снимок не снимает пометку недоставленного`() {
+    fun `история не снимает пометку недоставленного`() {
         val store = ChatStore()
         val local = store.appendUserMessage("привет")
         store.setFailed(local.id, true)
         store.setRetryable("привет")
 
-        store.mergeServerSnapshot(snapshot(6))
+        store.mergeServerMessages(listOf(serverMessage(6, text = "старый ответ", at = yesterday)))
 
-        assertTrue(store.messages.single { it.id == local.id }.failed)
+        assertEquals(listOf(6L, null), store.messages.map { it.serverId })
+        assertTrue(store.messages[1].failed)
         assertEquals("привет", store.state.value.retryable)
     }
 
+    /**
+     * Стримящийся пузырь ещё дописывается: промоут снял бы `streaming`, а серверная строка с
+     * тем же текстом — не его окончательная версия.
+     */
     @Test
-    fun `эхо в снимке промоутит локальное сообщение без дубля`() {
+    fun `стримящийся ответ не промоутится`() {
         val store = ChatStore()
-        val local = store.appendUserMessage("привет")
-        store.setFailed(local.id, true)
+        val placeholder = store.appendAssistantPlaceholder()
+        store.updateAssistantContent(placeholder.id, "Готово")
 
-        store.mergeServerSnapshot(listOf(serverMessage(6, text = "старый ответ"), serverMessage(7, role = "user", text = "привет")))
+        store.mergeServerMessages(listOf(serverMessage(12, text = "Готово")))
 
-        assertEquals(listOf(6L, 7L), store.messages.map { it.serverId })
-        assertEquals(local.id, store.messages[1].id)
-        assertFalse(store.messages[1].failed)
+        val bubble = store.messages.single { it.id == placeholder.id }
+        assertTrue(bubble.streaming)
+        assertNull(bubble.serverId)
+        assertEquals(2, store.messages.size)
+    }
+
+    /**
+     * Пользователь повторил вчерашний текст. Эхо — самая новая строка с этим текстом; вчерашняя
+     * не должна «съесть» ждущее сообщение.
+     */
+    @Test
+    fun `эхо забирает самая новая строка с тем же текстом`() {
+        val store = ChatStore()
+        val local = store.appendUserMessage("ок")
+
+        store.mergeServerMessages(
+            listOf(
+                serverMessage(3, role = "user", text = "ок", at = yesterday),
+                serverMessage(4, text = "принято", at = yesterday + 1_000),
+                serverMessage(9, role = "user", text = "ок"),
+            ),
+        )
+
+        assertEquals(listOf(3L, 4L, 9L), store.messages.map { it.serverId })
+        assertEquals(local.id, store.messages[2].id)
     }
 
     /** Два одинаковых неотправленных сообщения: эхо достаётся каждому по порядку, без дублей. */
@@ -186,73 +223,43 @@ class ChatStoreMergeTest {
         val first = store.appendUserMessage("да")
         val second = store.appendUserMessage("да")
 
-        store.mergeServerSnapshot(listOf(serverMessage(7, role = "user", text = "да"), serverMessage(8, role = "user", text = "да")))
+        store.mergeServerMessages(
+            listOf(serverMessage(7, role = "user", text = "да"), serverMessage(8, role = "user", text = "да")),
+        )
 
         assertEquals(listOf(first.id, second.id), store.messages.map { it.id })
         assertEquals(listOf(7L, 8L), store.messages.map { it.serverId })
     }
 
-    /** «привет» вчера и «привет» сегодня: строка, которую лента уже видела, эхом не бывает. */
+    /**
+     * Порядок между серверными строками — по серверному id, даже если страница пришла после
+     * неподтверждённого сообщения, которое старше части из них.
+     */
     @Test
-    fun `строка снимка не новее курсора не промоутит локальное сообщение`() {
+    fun `серверные строки встают по id вокруг недоставленного`() {
         val store = ChatStore()
-        store.mergeServerMessages(listOf(serverMessage(3, role = "user", text = "привет")))
-        val local = store.appendUserMessage("привет")
-
-        store.mergeServerSnapshot(listOf(serverMessage(3, role = "user", text = "привет")))
-
-        assertEquals(listOf(3L, null), store.messages.map { it.serverId })
-        assertEquals(local.id, store.messages[1].id)
-    }
-
-    @Test
-    fun `локальное сообщение остаётся между серверными строками, за которыми стояло`() {
-        val store = ChatStore()
-        store.mergeServerMessages(snapshot(6))
+        store.mergeServerMessages(listOf(serverMessage(6, text = "строка 6", at = yesterday)))
         val failed = store.appendUserMessage("не ушло")
         store.setFailed(failed.id, true)
-        store.mergeServerMessages(snapshot(9))
+        store.mergeServerMessages(listOf(serverMessage(9, text = "строка 9")))
 
-        store.mergeServerSnapshot(snapshot(5, 6, 9, 10))
+        store.mergeServerMessages(
+            listOf(
+                serverMessage(5, text = "строка 5", at = yesterday - 1_000),
+                serverMessage(6, text = "строка 6", at = yesterday),
+                serverMessage(9, text = "строка 9"),
+                serverMessage(10, text = "строка 10"),
+            ),
+        )
 
         assertEquals(listOf(5L, 6L, null, 9L, 10L), store.messages.map { it.serverId })
         assertEquals(failed.id, store.messages[2].id)
     }
 
     @Test
-    fun `локальное сообщение без предшественника в снимке встаёт перед следующей строкой`() {
+    fun `сброс identity стирает неподтверждённые сообщения`() {
         val store = ChatStore()
-        val local = store.appendUserMessage("не ушло")
-        store.mergeServerMessages(snapshot(9))
-
-        store.mergeServerSnapshot(snapshot(8, 9))
-
-        assertEquals(listOf(8L, null, 9L), store.messages.map { it.serverId })
-        assertEquals(local.id, store.messages[1].id)
-    }
-
-    @Test
-    fun `обрывок ответа уходит, когда снимок принёс ответ целиком`() {
-        val store = ChatStore()
-        val local = store.appendUserMessage("привет")
-        val placeholder = store.appendAssistantPlaceholder()
-        store.updateAssistantContent(placeholder.id, "Здрав")
-        store.finalizeAssistant(placeholder.id)
-
-        store.mergeServerSnapshot(
-            listOf(serverMessage(1, role = "user", text = "привет"), serverMessage(2, text = "Здравствуйте")),
-            supersededLocalId = placeholder.id,
-        )
-
-        assertEquals(listOf("привет", "Здравствуйте"), store.messages.map { it.content })
-        assertEquals(local.id, store.messages[0].id)
-    }
-
-    /** Смена пользователя уносит и неотправленное: оно принадлежит прежнему. */
-    @Test
-    fun `смена пользователя уносит локальные сообщения`() {
-        val store = ChatStore()
-        store.mergeServerMessages(snapshot(6))
+        store.mergeServerMessages(listOf(serverMessage(6, text = "a")))
         val failed = store.appendUserMessage("не ушло")
         store.setFailed(failed.id, true)
         store.setRetryable("не ушло")

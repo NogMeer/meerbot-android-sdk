@@ -526,17 +526,51 @@ class ChatControllerTest {
     }
 
     /**
-     * Поток оборвался, а хвост треда заканчивается СТАРЫМ ответом — эха сообщения в нём нет,
-     * сервер его не получил. Раньше такая лента заменяла текущую, и сообщение пропадало без
+     * Отправка дошла до сервера раньше, чем он собрал стартовую историю: эхо уже в ней. Эхо
+     * промоутит своё сообщение, дубля нет, id пузыря прежний.
+     */
+    @Test
+    fun `эхо сообщения в стартовой истории не двоит его`() {
+        val dispatcher = ScriptedDispatcher().also { server.dispatcher = it }
+        val echoOnly = """{"id":7,"role":"user","content":"привет","createdAt":"2026-09-13T10:00:00.000Z"}"""
+        val historyGate = dispatcher.gateNextHistory(ScriptedDispatcher.history(messages = "$earlierThread, $echoOnly"))
+        val streamGate = dispatcher.gateNextStream(ScriptedDispatcher.sse(answerStream))
+        val controller = controller()
+
+        controller.start()
+        dispatcher.awaitHistory()
+        controller.send("привет")
+        dispatcher.awaitStream()
+        val localId = controller.state.value.messages.single { it.role == "user" }.id
+        historyGate.countDown()
+        await(controller) { it.ready }
+
+        val applied = controller.state.value
+        assertEquals(listOf("старый вопрос", "старый ответ", "привет", ""), applied.messages.map { it.content })
+        assertEquals(localId, applied.messages[2].id)
+        assertEquals(7L, applied.messages[2].serverId)
+        assertTrue(applied.messages[3].streaming)
+
+        dispatcher.historyFallback = { ScriptedDispatcher.history(messages = echoPage) }
+        streamGate.countDown()
+        await(controller) { s -> !s.sending && s.messages.any { it.serverId == 8L } }
+
+        val state = controller.state.value
+        assertEquals(listOf(5L, 6L, 7L, 8L), state.messages.map { it.serverId })
+        assertEquals(localId, state.messages[2].id)
+    }
+
+    /**
+     * Обрыв ДО того, как сервер записал сообщение, а история кончается прошлым ответом бота.
+     * До правки это считалось «ответ дописан», лента заменялась, и сообщение пропадало без
      * «Повторить».
      */
     @Test
-    fun `обрыв с хвостом без эха оставляет сообщение недоставленным`() {
+    fun `обрыв до записи сообщения не принимается за доставку`() {
         val controller = started()
-        server.enqueue(
-            sse("data: {\"choices\":[{\"delta\":{\"content\":\"нача\"}}]}\n\n")
-                .setSocketPolicy(SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY)
-        )
+        // Отказ шлюза, а не обрыв сокета: обрыв сразу после запроса OkHttp молча повторяет,
+        // и повтор забрал бы из очереди следующий ответ — историю — как тело потока.
+        server.enqueue(ScriptedDispatcher.error(502, "bad_gateway"))
         server.enqueue(history(messages = earlierThread))
 
         controller.send("привет")
@@ -546,6 +580,34 @@ class ChatControllerTest {
         assertEquals(listOf("старый вопрос", "старый ответ", "привет"), state.messages.map { it.content })
         assertTrue(state.messages.last().failed)
         assertEquals("привет", state.retryable)
+    }
+
+    /**
+     * Плановый рестарт сервера посреди ответа, сервер ответ дописал. История вливается, а не
+     * заменяет ленту, — недописанный пузырь не должен остаться рядом с серверной версией.
+     */
+    @Test
+    fun `рестарт сервера посреди ответа не двоит ответ`() {
+        val dispatcher = ScriptedDispatcher().also { server.dispatcher = it }
+        val controller = controller()
+        controller.start()
+        await(controller) { it.ready }
+        dispatcher.historyFallback = { ScriptedDispatcher.history(messages = echoPage) }
+        dispatcher.streamFallback = {
+            ScriptedDispatcher.sse(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Здрав\"}}]}\n\n" +
+                    "event: shutdown\ndata: {\"reason\":\"server_restart\"}\n\n",
+            )
+        }
+
+        controller.send("привет")
+
+        await(controller) { s ->
+            !s.sending && s.messages.any { it.serverId == 8L } && s.messages.none { it.content == "Здрав" }
+        }
+        val state = controller.state.value
+        assertEquals(listOf("привет", "Здравствуйте"), state.messages.map { it.content })
+        assertEquals(listOf(7L, 8L), state.messages.map { it.serverId })
     }
 
     /** Смена пользователя по-прежнему уносит и то, что ещё отправляется. */

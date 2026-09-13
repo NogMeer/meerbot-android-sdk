@@ -299,7 +299,7 @@ class ChatController(
 
         streamJob = scope.launch {
             try {
-                client.sendMessage(text).collect { handle(it, placeholderId) }
+                client.sendMessage(text).collect { handle(it, userMessageId, placeholderId) }
                 store.finalizeAssistant(placeholderId)
                 store.dropEmptyPlaceholder(placeholderId)
                 store.setSending(false)
@@ -319,7 +319,7 @@ class ChatController(
         }
     }
 
-    private fun handle(event: ChatStreamEvent, placeholderId: String) {
+    private fun handle(event: ChatStreamEvent, userMessageId: String, placeholderId: String) {
         when (event) {
             is ChatStreamEvent.Meta -> store.setMode(event.mode)
 
@@ -358,9 +358,15 @@ class ChatController(
 
             is ChatStreamEvent.Shutdown -> {
                 // Плановый рестарт сервера — не сетевой сбой. Ответ уже могли дописать в БД.
+                // История вливается, а не заменяет ленту, поэтому недописанный пузырь убираем
+                // сами, если сервер ответ дописал. Смена пользователя между шагами безопасна:
+                // `fetchHistory` сверяет эпоху, а id прежней ленты в новой не найдутся.
                 store.finalizeAssistant(placeholderId)
                 store.setSending(false)
-                scope.launch { runCatching { loadHistory(brokenAnswerId = placeholderId) } }
+                scope.launch {
+                    runCatching { loadHistory() }
+                    settleInterruptedReply(userMessageId, placeholderId)
+                }
             }
 
             is ChatStreamEvent.Unknown -> Unit
@@ -397,16 +403,16 @@ class ChatController(
             return
         }
 
-        // Ответ мог быть дописан сервером, пока рвалось соединение. Серверную ленту
-        // принимаем, только если она заканчивается ответом: тогда обрывок уступает ему место.
+        // Ответ мог быть дописан сервером, пока рвалось соединение. Историю вливаем, а
+        // доставкой считаем только эхо ЭТОГО сообщения с ответом после него. Раньше хватало
+        // «лента кончается ответом»: прошлый ответ бота выдавал недошедшее сообщение за
+        // доставленное, замена ленты стирала его, и «Повторить» не было.
         val items = runCatching { fetchHistory() }.getOrNull()
         // Пользователь сменился, пока шёл запрос: его новой ленте чужой «Повторить» не нужен.
         if (identityEpoch.get() != startedEpoch) return
-        if (items != null && items.lastOrNull()?.role == "assistant") {
-            store.mergeServerSnapshot(items, supersededLocalId = placeholderId)
-            // Эхо сообщения пришло — сервер его получил. Нет эха — ответ в хвосте старый,
-            // сообщение не дошло и остаётся недоставленным (раньше замена ленты его стирала).
-            if (store.messages.none { it.id == userMessageId && it.serverId == null }) return
+        if (items != null) {
+            store.mergeServerMessages(items)
+            if (settleInterruptedReply(userMessageId, placeholderId)) return
         }
 
         store.setFailed(userMessageId, true)
@@ -414,18 +420,33 @@ class ChatController(
     }
 
     /**
-     * Хвост треда: серверные строки — источник правды, но сообщения, которые ещё отправляются
-     * или ждут «Повторить», остаются (см. [ChatStore.mergeServerSnapshot]). Человек мог написать,
-     * пока стартовая история была в пути, — раньше она заменяла ленту и сообщение пропадало.
+     * История треда, ВЛИТАЯ в ленту.
      *
-     * @param brokenAnswerId обрывок ответа (плановый рестарт сервера посреди потока). Если хвост
-     *   заканчивается ответом, сервер его дописал — обрывок уходит, иначе встал бы рядом.
+     * Не замена: пользователь пишет, как только открылся экран, и ответ стартовой истории
+     * приходит уже после отправки. Замена убирала с экрана отправленное сообщение и
+     * стримящийся ответ — при том что сообщение могло уже дойти до сервера. Слияние
+     * сохраняет неподтверждённые строки, узнаёт эхо своих и ставит историю над ними.
      */
-    private suspend fun loadHistory(brokenAnswerId: String? = null) {
+    private suspend fun loadHistory() {
         val items = fetchHistory() ?: return
-        if (items.isEmpty()) return
-        val superseded = brokenAnswerId?.takeIf { items.last().role == "assistant" }
-        store.mergeServerSnapshot(items, supersededLocalId = superseded)
+        store.mergeServerMessages(items)
+    }
+
+    /**
+     * Сервер дописал ответ на прерванную отправку: сообщение получило серверный id, и после
+     * него есть серверный ответ. Недописанный локальный пузырь тогда лишний — серверная
+     * версия ответа уже в ленте, и без удаления пользователь видел бы ответ дважды.
+     *
+     * Звать ПОСЛЕ слияния истории.
+     */
+    private fun settleInterruptedReply(userMessageId: String, placeholderId: String): Boolean {
+        val feed = store.messages
+        val userServerId = feed.firstOrNull { it.id == userMessageId }?.serverId ?: return false
+        if (feed.none { it.role == "assistant" && (it.serverId ?: 0L) > userServerId }) return false
+        if (feed.firstOrNull { it.id == placeholderId }?.serverId == null) {
+            store.removeMessage(placeholderId)
+        }
+        return true
     }
 
     /**
