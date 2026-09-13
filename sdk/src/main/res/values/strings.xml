@@ -34,6 +34,7 @@
     <string name="meerbot_err_invalid_response">Неожиданный ответ сервера.</string>
     <string name="meerbot_err_cancelled">Запрос не выполнен. Попробуйте ещё раз.</string>
     <string name="meerbot_err_session_lost">Сессия недействительна. Откройте чат заново.</string>
+    <string name="meerbot_err_generation_in_progress">Ответ ещё готовится. Повторите чуть позже.</string>
 
     <string name="meerbot_not_configured_title">MeerBot не настроен</string>
     <string name="meerbot_not_configured_body">Вызовите MeerBot.configure(context, apiKey) при старте приложения.</string>

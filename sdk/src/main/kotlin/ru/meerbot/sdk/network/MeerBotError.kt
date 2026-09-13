@@ -78,6 +78,9 @@ sealed class MeerBotError(message: String) : Exception(message) {
                     R.string.meerbot_err_rate_limited
                 errorCode == "message_too_long" -> R.string.meerbot_err_message_too_long
                 errorCode == "identity_required" -> R.string.meerbot_err_identity_required
+                // Ответ на это же сообщение генерирует другой запрос (повтор после обрыва):
+                // сообщение сохранено, ответ придёт догоном, «Повторить» безопасен.
+                errorCode == GENERATION_IN_PROGRESS -> R.string.meerbot_err_generation_in_progress
                 // До экрана такая ошибка доходит, только когда переподключение уже было и не
                 // помогло (SDK повторяет его сам, один раз). «Переподключаемся…» здесь — неправда.
                 isExpiredToken -> R.string.meerbot_err_session_lost
@@ -87,9 +90,11 @@ sealed class MeerBotError(message: String) : Exception(message) {
 
             is Network -> R.string.meerbot_err_network
 
-            is Stream ->
-                if (errorCode == "ai_unavailable") R.string.meerbot_err_ai_unavailable
-                else R.string.meerbot_err_stream_broken
+            is Stream -> when (errorCode) {
+                "ai_unavailable" -> R.string.meerbot_err_ai_unavailable
+                GENERATION_IN_PROGRESS -> R.string.meerbot_err_generation_in_progress
+                else -> R.string.meerbot_err_stream_broken
+            }
 
             is InvalidResponse -> R.string.meerbot_err_invalid_response
             is Cancelled -> R.string.meerbot_err_cancelled
@@ -109,3 +114,6 @@ sealed class MeerBotError(message: String) : Exception(message) {
         get() = this is Http && status == 401 &&
             (errorCode.startsWith("jwt_") || errorCode == "device_not_found" || errorCode == "device_claim_missing")
 }
+
+/** Ответ на это сообщение генерирует другой запрос. Вне класса: публичный API ошибки не растёт. */
+private const val GENERATION_IN_PROGRESS = "generation_in_progress"

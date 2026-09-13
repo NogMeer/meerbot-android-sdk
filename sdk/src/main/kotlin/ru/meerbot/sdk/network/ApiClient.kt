@@ -5,6 +5,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.FlowCollector
@@ -28,6 +29,7 @@ import java.util.Locale
 import java.util.TimeZone
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.random.Random
 
 /** Ответ рукопожатия `/api/v1/mobile/register`. */
 data class MobileSession(
@@ -43,7 +45,14 @@ data class HistoryPage(
     val messages: List<HistoryMessage>,
     val hasMore: Boolean,
     val mode: ChatMode,
-)
+) {
+    /**
+     * Сервер знает `clientMessageId`: хоть одна строка пользователя на странице несёт ключ (пусть
+     * и `null` у старых строк). Страница без строк пользователя о поддержке ничего не говорит.
+     * В теле класса — вне конструктора и `equals` публичного data-класса.
+     */
+    internal var clientMessageIdsSupported: Boolean = false
+}
 
 /** Сообщение из истории `/api/v1/mobile/messages`. */
 data class HistoryMessage(
@@ -56,7 +65,16 @@ data class HistoryMessage(
     val authorKind: String?,
     val authorName: String?,
     val createdAtMs: Long,
-)
+) {
+    /**
+     * `clientMessageId` строки пользователя (в нижнем регистре), с которым её отправило
+     * устройство; `null` — строка ассистента, строка старого клиента или старый сервер. По нему
+     * SDK узнаёт своё отправленное сообщение без сверки текста. Поле в теле класса: новый параметр
+     * конструктора публичного data-класса сломал бы приложения, собранные против 0.2.8.
+     */
+    var clientMessageId: String? = null
+        internal set
+}
 
 /**
  * Клиент канала `mobile_app`: держит JWT, обновляет его по истечении и стримит ответы.
@@ -80,6 +98,8 @@ class ApiClient internal constructor(
     private val httpClient: OkHttpClient,
     /** Сигнал выхода, не подтверждённый сервером. Переживает процесс, если хранилище это умеет. */
     private val logoutFlag: LogoutFlagStore,
+    /** Счётчик смен identity (`identitySeq`). Растёт вместе с флагом выхода, см. [IdentitySeqStore]. */
+    private val identitySeq: IdentitySeqStore = InMemoryIdentitySeqStore(),
 ) {
 
     /**
@@ -94,7 +114,7 @@ class ApiClient internal constructor(
         visitorUuid: String,
         installationId: String,
         httpClient: OkHttpClient = defaultHttpClient(),
-    ) : this(config, visitorUuid, installationId, httpClient, InMemoryLogoutFlagStore())
+    ) : this(config, visitorUuid, installationId, httpClient, InMemoryLogoutFlagStore(), InMemoryIdentitySeqStore())
 
     private val tokenMutex = Mutex()
 
@@ -141,6 +161,26 @@ class ApiClient internal constructor(
 
     @Volatile
     private var identityToken: String? = null
+
+    /** `deviceId` последнего сохранённого рукопожатия. Пишется и читается только под [sessionLock]. */
+    private var lastDeviceId: String? = null
+
+    /**
+     * Ревизия устройства: растёт, когда сохранённое рукопожатие вернуло ДРУГОЙ `deviceId`, чем
+     * прежнее (сервер завёл новую строку устройства или восстановил отставную). Тред у нового
+     * устройства другой, а id сообщений глобальные: догон `since=` по курсору прежнего треда
+     * пропустил бы все строки нового, что старше курсора. Контроллер, увидев новую ревизию,
+     * сбрасывает серверную часть ленты и курсор и грузит историю заново.
+     */
+    @Volatile
+    internal var deviceRevision: Int = 0
+        private set
+
+    /**
+     * Ожидание перед повтором после 503. Подменяется в тестах, чтобы проверять задержку, а не
+     * спать; в работе — обычный `delay`, отменяемый вместе с запросом.
+     */
+    internal var unavailableRetryDelay: suspend (Long) -> Unit = { delay(it) }
 
     /** Диалог текущего устройства. Приходит из `meta`; в запросы НЕ уходит. */
     @Volatile
@@ -281,6 +321,10 @@ class ApiClient internal constructor(
      */
     internal fun persistLogoutIntent() {
         synchronized(sessionLock) { unappliedLogouts++ }
+        // Счётчик identity — на диск РАНЬШЕ флага. Убитый между записями процесс со счётчиком без
+        // флага ничего не теряет (лишний шаг счётчика безвреден), а флаг со старым счётчиком
+        // ушёл бы выходом, который сервер вправе счесть устаревшим.
+        identitySeq.increment(durable = true)
         logoutFlag.persistPending()
     }
 
@@ -293,6 +337,10 @@ class ApiClient internal constructor(
      */
     private fun beginNewIdentity(token: String?) {
         synchronized(sessionLock) {
+            // Счётчик — в той же критической секции, что флаг: рукопожатие, прочитавшее новый
+            // флаг, всегда несёт и новый счётчик. Повторный шаг после [persistLogoutIntent]
+            // безвреден — сервер сравнивает только «меньше».
+            identitySeq.increment()
             logoutFlag.pending = true
             identityToken = token
             generation++
@@ -312,16 +360,21 @@ class ApiClient internal constructor(
         // отбрасывается, запрос повторяется с новой. Повторов конечное число (паритет с iOS):
         // хост, дёргающий identify() в цикле, не должен превратить рукопожатие в бесконечное.
         // Свежий токен того же человека повтора не требует (см. [tokenRevision]).
-        repeat(MAX_REGISTER_ATTEMPTS) {
+        // Повтор после 503 — отдельный и единственный: попытку смены identity он не съедает.
+        var attempt = 0
+        var unavailableRetried = false
+        while (attempt < MAX_REGISTER_ATTEMPTS) {
             val startedIn: Int
             val startedRevision: Int
             val token: String?
             val logoutSent: Boolean
+            val seqSent: Long
             synchronized(sessionLock) {
                 startedIn = generation
                 startedRevision = tokenRevision
                 token = identityToken
                 logoutSent = logoutFlag.pending
+                seqSent = identitySeq.value
             }
 
             val body = JSONObject()
@@ -332,6 +385,9 @@ class ApiClient internal constructor(
                 .put("sdkVersion", config.sdkVersion)
             token?.let { body.put("identityToken", it) }
             if (logoutSent) body.put("logout", true)
+            // Всегда, в том числе 0: сервер упорядочивает выходы и входы по счётчику, а не по
+            // часам бэкенда интегратора. Старый сервер поле игнорирует.
+            body.put("identitySeq", seqSent)
 
             val request = newRequest("/api/v1/mobile/register")
                 .post(body.toString().toRequestBody(JSON))
@@ -341,10 +397,24 @@ class ApiClient internal constructor(
             // Поколение сверяется ДО разбора: ответ прежней identity — чужой, будь он хоть
             // битым, хоть отказом. Бросить его ошибку значило бы показать новому человеку
             // провал запроса, которого он не делал, вместо повтора с его токеном.
-            if (synchronized(sessionLock) { generation != startedIn }) return@repeat
+            if (synchronized(sessionLock) { generation != startedIn }) {
+                attempt++
+                continue
+            }
 
-            val session = parseSession(raw, logoutSent, startedIn, startedRevision)
-                ?: return@repeat
+            // 503 (`registration_conflict` параллельных регистраций, рестарт) — временный отказ:
+            // один повтор после `Retry-After`, дальше ошибка уходит вызывающему.
+            if (raw.code == HTTP_UNAVAILABLE && !unavailableRetried) {
+                unavailableRetried = true
+                unavailableRetryDelay(unavailableDelayMs(raw.retryAfter))
+                continue
+            }
+
+            val session = parseSession(raw, logoutSent, seqSent, startedIn, startedRevision)
+            if (session == null) {
+                attempt++
+                continue
+            }
             return session
         }
         // Отмена, а не сетевая ошибка: рукопожатие перебили смены пользователя. Контроллер
@@ -353,12 +423,13 @@ class ApiClient internal constructor(
     }
 
     /**
-     * Разобрать ответ рукопожатия и сохранить сессию. `null` — пока разбирали, поколение
-     * сменилось, и сессия не сохранена.
+     * Разобрать ответ рукопожатия и сохранить сессию. `null` — сессия не сохранена: пока
+     * разбирали, поколение сменилось, либо сервер сообщил счётчик identity больше отправленного.
      */
     private fun parseSession(
         raw: RawResponse,
         logoutSent: Boolean,
+        seqSent: Long,
         startedIn: Int,
         startedRevision: Int,
     ): MobileSession? {
@@ -375,9 +446,27 @@ class ApiClient internal constructor(
         // кривой, и сигнал уйдёт снова. Паритет с iOS (`identity["unlinked"] is Bool`).
         val unlinkedConfirmed = identity != null && !identity.isNull("unlinked") &&
             identity.opt("unlinked") is Boolean
+        val serverSeq = (identity?.takeUnless { it.isNull("seq") }?.opt("seq") as? Number)?.toLong()
 
         val committed = synchronized(sessionLock) {
             if (generation != startedIn) return@synchronized false
+            // Сервер хранит счётчик больше отправленного: локальный потерян (сброс данных
+            // приложения без `reset()`, битое хранилище). Такой запрос сервер счёл устаревшим и
+            // identity из него не применил — ни токен, ни выход. Сессия не сохраняется, флаг не
+            // снимается; счётчик догоняет серверный, и повтор уходит с актуальным значением.
+            if (serverSeq != null && serverSeq > seqSent) {
+                identitySeq.raiseTo(serverSeq)
+                return@synchronized false
+            }
+            // Другое устройство, чем у прошлого рукопожатия (восстановление отставной строки,
+            // новая строка после выхода): диалог и курсор прежнего к нему не относятся.
+            val previousDevice = lastDeviceId
+            if (previousDevice != null && previousDevice != deviceId) {
+                deviceRevision++
+                conversationId = null
+                lastMessageId = null
+            }
+            lastDeviceId = deviceId
             // Свежий токен того же человека пришёл в полёте: JWT отдаём ждущему запросу (связь
             // та же), но не кэшируем — следующий запрос зарегистрируется со свежим токеном.
             // Статус тоже не публикуем: он описывает прежний токен, а хост уже передал новый
@@ -444,6 +533,7 @@ class ApiClient internal constructor(
 
         val raw = json.optJSONArray("messages") ?: throw MeerBotError.InvalidResponse
         val messages = ArrayList<HistoryMessage>(raw.length())
+        var clientIdsSupported = false
         for (i in 0 until raw.length()) {
             val item = raw.optJSONObject(i) ?: continue
             val id = item.optLongOrNull("id") ?: continue
@@ -455,7 +545,13 @@ class ApiClient internal constructor(
                 authorKind = item.optStringOrNull("authorKind"),
                 authorName = item.optStringOrNull("authorName"),
                 createdAtMs = parseTimestamp(item.optStringOrNull("createdAt")),
-            )
+            ).apply {
+                // Ключ у строки пользователя (даже `null`) — сервер знает `clientMessageId`.
+                if (role == "user" && item.has("clientMessageId")) {
+                    clientIdsSupported = true
+                    clientMessageId = item.optStringOrNull("clientMessageId")?.lowercase()
+                }
+            }
         }
         // Страница, запрошенная до смены человека, курсор нового не двигает.
         messages.lastOrNull()?.let { last ->
@@ -467,7 +563,7 @@ class ApiClient internal constructor(
             messages = messages,
             hasMore = json.optBoolean("hasMore", false),
             mode = ChatMode.from(json.optStringOrNull("mode")),
-        )
+        ).apply { clientMessageIdsSupported = clientIdsSupported }
     }
 
     // ─── Стрим ответа ─────────────────────────────────────────────────────────────────────
@@ -481,20 +577,46 @@ class ApiClient internal constructor(
      * запрос повторяется РОВНО один раз; 403 `channel_mismatch` не повторяется никогда —
      * перепутан ключ, и новый токен будет ровно таким же.
      */
-    fun sendMessage(text: String): Flow<ChatStreamEvent> = flow {
-        runStream(text, allowRetry = true, collector = this, startedIn = currentGeneration())
+    fun sendMessage(text: String): Flow<ChatStreamEvent> = sendMessage(text, clientMessageId = null)
+
+    /**
+     * Отправка с `clientMessageId` — идемпотентная: сервер не сохранит сообщение с этим id
+     * дважды и не сгенерирует второй ответ, а на повтор отдаст уже готовый (`meta.replayed`).
+     * Id уходит и в повтор после переподключения. `null` — прежний, неидемпотентный путь.
+     */
+    internal fun sendMessage(text: String, clientMessageId: String?): Flow<ChatStreamEvent> = flow {
+        runStream(
+            text = text,
+            clientMessageId = clientMessageId,
+            allowReauthorize = true,
+            allowUnavailableRetry = true,
+            collector = this,
+            startedIn = currentGeneration(),
+        )
     }.flowOn(Dispatchers.IO)
 
     private fun currentGeneration(): Int = synchronized(sessionLock) { generation }
 
+    /** Почему запрос потока нужно повторить, не отдав вызывающему ни одного кадра. */
+    private sealed class StreamRetry {
+        /** 401 `jwt_*`: сессия переоткрывается, запрос повторяется один раз. */
+        object Reauthorize : StreamRetry()
+
+        /** 503: один повтор после паузы. */
+        class Unavailable(val delayMs: Long) : StreamRetry()
+    }
+
     /** @param startedIn поколение identity на момент отправки — см. [emit]. */
     private suspend fun runStream(
         text: String,
-        allowRetry: Boolean,
+        clientMessageId: String?,
+        allowReauthorize: Boolean,
+        allowUnavailableRetry: Boolean,
         collector: FlowCollector<ChatStreamEvent>,
         startedIn: Int,
     ) {
         val body = JSONObject().put("message", text)
+        clientMessageId?.let { body.put("clientMessageId", it) }
 
         val request = newRequest("/api/v1/mobile/chat/stream")
             .post(body.toString().toRequestBody(JSON))
@@ -509,7 +631,8 @@ class ApiClient internal constructor(
             .build()
             .newCall(request)
 
-        cancelCallOnCancellation(call) {
+        // Повтор решается внутри, а выполняется снаружи: ответ закрыт, сторож вызова снят.
+        val retry: StreamRetry? = cancelCallOnCancellation(call) {
             val response = try {
                 call.execute()
             } catch (e: IOException) {
@@ -519,11 +642,12 @@ class ApiClient internal constructor(
 
             response.use {
                 if (!it.isSuccessful) {
+                    val retryAfter = it.header("Retry-After")
                     val error = decodeError(it.code, it.body?.string())
-                    if (allowRetry && error.isExpiredToken) {
-                        invalidateToken()
-                        runStream(text, allowRetry = false, collector = collector, startedIn = startedIn)
-                        return@use
+                    if (allowReauthorize && error.isExpiredToken) return@use StreamRetry.Reauthorize
+                    // До первого байта потока: ни одного кадра вызывающий ещё не получил.
+                    if (allowUnavailableRetry && it.code == HTTP_UNAVAILABLE) {
+                        return@use StreamRetry.Unavailable(unavailableDelayMs(retryAfter))
                     }
                     throw error
                 }
@@ -538,6 +662,19 @@ class ApiClient internal constructor(
                     currentCoroutineContext().ensureActive()
                     throw MeerBotError.Network(e.message ?: "stream_broken")
                 }
+                null
+            }
+        }
+
+        when (retry) {
+            null -> Unit
+            StreamRetry.Reauthorize -> {
+                invalidateToken()
+                runStream(text, clientMessageId, allowReauthorize = false, allowUnavailableRetry, collector, startedIn)
+            }
+            is StreamRetry.Unavailable -> {
+                unavailableRetryDelay(retry.delayMs)
+                runStream(text, clientMessageId, allowReauthorize, allowUnavailableRetry = false, collector, startedIn)
             }
         }
     }
@@ -549,7 +686,7 @@ class ApiClient internal constructor(
      * пришлёт байт: закрытый экран держал запрос (и генерацию ответа) до следующего кадра.
      * Сторож — дочерняя корутина: отмена родителя отменяет её сразу, и она закрывает вызов.
      */
-    private suspend fun cancelCallOnCancellation(call: Call, block: suspend () -> Unit) = coroutineScope {
+    private suspend fun <T> cancelCallOnCancellation(call: Call, block: suspend () -> T): T = coroutineScope {
         val finished = AtomicBoolean(false)
         val watcher = launch(start = CoroutineStart.UNDISPATCHED) {
             try {
@@ -599,7 +736,7 @@ class ApiClient internal constructor(
         header("X-SDK-Version", config.sdkVersion)
 
     /** Ответ, прочитанный целиком, но ещё не разобранный. */
-    private class RawResponse(val code: Int, val successful: Boolean, val text: String?)
+    private class RawResponse(val code: Int, val successful: Boolean, val text: String?, val retryAfter: String?)
 
     /** Выполнить запрос и прочитать тело. Разбор — отдельно: рукопожатию нужно сперва сверить поколение. */
     private suspend fun execute(request: Request): RawResponse = withContext(Dispatchers.IO) {
@@ -614,7 +751,7 @@ class ApiClient internal constructor(
             } catch (e: IOException) {
                 throw MeerBotError.Network(e.message ?: "io")
             }
-            RawResponse(it.code, it.isSuccessful, text)
+            RawResponse(it.code, it.isSuccessful, text, it.header("Retry-After"))
         }
     }
 
@@ -644,6 +781,21 @@ class ApiClient internal constructor(
         /** Первая попытка рукопожатия и один повтор после смены identity в полёте (как iOS). */
         private const val MAX_REGISTER_ATTEMPTS = 2
         private const val STREAM_READ_TIMEOUT_S = 60L
+        private const val HTTP_UNAVAILABLE = 503
+        /** Пауза, если `Retry-After` нет или он не в секундах (HTTP-дата). */
+        private const val UNAVAILABLE_DEFAULT_DELAY_MS = 1_000L
+        /** Потолок паузы: дольше держать отправку (и мьютекс рукопожатия) нельзя — паритет с iOS. */
+        private const val UNAVAILABLE_MAX_DELAY_MS = 5_000L
+        /** Разброс: параллельные клиенты после общего 503 не должны прийти разом. */
+        private const val UNAVAILABLE_MAX_JITTER_MS = 250L
+
+        /** Пауза перед повтором после 503: `Retry-After` в секундах, не больше потолка, плюс разброс. */
+        internal fun unavailableDelayMs(retryAfter: String?): Long {
+            val seconds = retryAfter?.trim()?.toLongOrNull()
+            val base = if (seconds == null) UNAVAILABLE_DEFAULT_DELAY_MS
+            else (seconds.coerceAtLeast(0L) * 1000L).coerceAtMost(UNAVAILABLE_MAX_DELAY_MS)
+            return base.coerceAtMost(UNAVAILABLE_MAX_DELAY_MS) + Random.nextLong(0L, UNAVAILABLE_MAX_JITTER_MS + 1)
+        }
 
         fun defaultHttpClient(): OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)

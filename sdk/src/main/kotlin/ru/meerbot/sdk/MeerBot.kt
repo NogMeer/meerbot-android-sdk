@@ -22,6 +22,7 @@ import ru.meerbot.sdk.network.ApiClient
 import ru.meerbot.sdk.network.IdentityCoordinator
 import ru.meerbot.sdk.network.IdentityStatus
 import ru.meerbot.sdk.network.MeerBotConfiguration
+import ru.meerbot.sdk.network.PrefsIdentitySeqStore
 import ru.meerbot.sdk.network.PrefsLogoutFlagStore
 import ru.meerbot.sdk.network.PrefsSubjectHashStore
 import ru.meerbot.sdk.state.ChatController
@@ -189,7 +190,15 @@ object MeerBot {
         // тред. Он стабилен и не подменяется пуш-токеном: смена значения означала бы для
         // пользователя новую переписку с нуля.
         val installation = getOrCreate(store, KEY_INSTALLATION_ID) { "and-" + UUID.randomUUID() }
-        val apiClient = ApiClient(configuration, uuid, installation, httpClient, PrefsLogoutFlagStore(store))
+        val apiClient = ApiClient(
+            configuration,
+            uuid,
+            installation,
+            httpClient,
+            PrefsLogoutFlagStore(store),
+            // Счётчик смен identity — в тех же prefs: `reset()` чистит его вместе с установкой.
+            PrefsIdentitySeqStore(store),
+        )
         val chat = ChatController(apiClient, scope)
         val coordinator = IdentityCoordinator(
             client = apiClient,

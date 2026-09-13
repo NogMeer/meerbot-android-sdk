@@ -96,6 +96,88 @@ class IdentityStoresTest {
         assertEquals(listOf("logout_flag_write_failed"), errors)
     }
 
+    // ─── Счётчик identity ─────────────────────────────────────────────────────────────────
+
+    @Test
+    fun `счётчик identity растёт и переживает пересоздание хранилища`() {
+        assertEquals(1L, PrefsIdentitySeqStore(prefs, reporter).increment())
+
+        assertEquals(1L, PrefsIdentitySeqStore(prefs, reporter).value)
+        assertEquals(2L, PrefsIdentitySeqStore(prefs, reporter).increment())
+        assertTrue(errors.isEmpty())
+    }
+
+    /** Выход пишется синхронно: процесс могут убить до того, как отложенная запись ляжет на диск. */
+    @Test
+    fun `счётчик выхода пишется на диск синхронно`() {
+        PrefsIdentitySeqStore(prefs, reporter).increment(durable = true)
+
+        assertEquals(1, prefs.commits)
+        assertEquals(0, prefs.applies)
+        assertEquals(1L, prefs.values[PrefsIdentitySeqStore.KEY])
+    }
+
+    @Test
+    fun `обычный рост счётчика — отложенная запись`() {
+        PrefsIdentitySeqStore(prefs, reporter).increment()
+
+        assertEquals(0, prefs.commits)
+        assertEquals(1, prefs.applies)
+    }
+
+    @Test
+    fun `нечитаемый счётчик — ноль и названная ошибка, а не падение`() {
+        prefs.values[PrefsIdentitySeqStore.KEY] = 7L
+        prefs.failReads = true
+
+        assertEquals(0L, PrefsIdentitySeqStore(prefs, reporter).value)
+        assertEquals(listOf("identity_seq_read_failed"), errors)
+    }
+
+    @Test
+    fun `незаписанный счётчик остаётся в памяти процесса`() {
+        prefs.failWrites = true
+        prefs.failReads = true
+        val store = PrefsIdentitySeqStore(prefs, reporter)
+
+        store.increment()
+
+        assertEquals(1L, store.value)
+        // Чтение сбойного хранилища тоже названо: рост идёт от прочитанного значения.
+        assertEquals(listOf("identity_seq_read_failed", "identity_seq_write_failed"), errors)
+    }
+
+    /** Серверное значение больше локального: счётчик догоняет его, ниже — не опускается. */
+    @Test
+    fun `счётчик поднимается до серверного и не падает обратно`() {
+        val store = PrefsIdentitySeqStore(prefs, reporter)
+        store.increment()
+
+        store.raiseTo(40L)
+        assertEquals(40L, store.value)
+
+        store.raiseTo(3L)
+        assertEquals(40L, store.value)
+        assertEquals(41L, store.increment())
+    }
+
+    /** Сервер принимает `identitySeq` в `0..2147483647`: выше — 400 на каждом рукопожатии. */
+    @Test
+    fun `счётчик не выходит за предел, принимаемый сервером`() {
+        val store = PrefsIdentitySeqStore(prefs, reporter)
+
+        store.raiseTo(Long.MAX_VALUE)
+        assertEquals(Int.MAX_VALUE.toLong(), store.value)
+        assertEquals(Int.MAX_VALUE.toLong(), store.increment())
+    }
+
+    @Test
+    fun `битый счётчик на диске не выходит за предел`() {
+        prefs.values[PrefsIdentitySeqStore.KEY] = Long.MAX_VALUE
+
+        assertEquals(Int.MAX_VALUE.toLong(), PrefsIdentitySeqStore(prefs, reporter).value)
+    }
+
     @Test
     fun `хеш субъекта пишется, читается и стирается`() {
         PrefsSubjectHashStore(prefs, reporter).hash = "abc"

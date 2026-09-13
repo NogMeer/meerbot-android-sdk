@@ -41,6 +41,14 @@ class ScriptedDispatcher : Dispatcher() {
     @Volatile
     var streamFallback: () -> MockResponse = { MockResponse().setResponseCode(404) }
 
+    /**
+     * Ответ потока, зависящий от запроса: сервер возвращает `clientMessageId` из тела эхом, и
+     * тест не имеет права подставлять id сам — иначе он проверял бы свою же подстановку.
+     * Приоритетнее [streamFallback], но не отменяет запланированные шаги.
+     */
+    @Volatile
+    var streamResponder: ((RecordedRequest) -> MockResponse)? = null
+
     fun gateNextHistory(response: MockResponse): CountDownLatch =
         CountDownLatch(1).also { historySteps.add(Step(response, it)) }
 
@@ -76,7 +84,9 @@ class ScriptedDispatcher : Dispatcher() {
             path.startsWith("/api/v1/mobile/messages") ->
                 respond(request, historyArrivals, historySteps, historyFallback)
             path.startsWith("/api/v1/mobile/chat/stream") ->
-                respond(request, streamArrivals, streamSteps, streamFallback)
+                respond(request, streamArrivals, streamSteps) {
+                    streamResponder?.invoke(request) ?: streamFallback()
+                }
             else -> MockResponse().setResponseCode(404)
         }
     }

@@ -12,6 +12,7 @@ import kotlinx.coroutines.launch
 import ru.meerbot.sdk.network.ApiClient
 import ru.meerbot.sdk.network.ChatStreamEvent
 import ru.meerbot.sdk.network.HistoryMessage
+import ru.meerbot.sdk.network.HistoryPage
 import ru.meerbot.sdk.network.MeerBotError
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -62,12 +63,27 @@ class ChatController(
      */
     private val identityEpoch = AtomicInteger()
 
+    /**
+     * Устройство, чьему треду принадлежит лента. Рукопожатие может вернуть ДРУГОЕ устройство того
+     * же человека (отставная строка восстановлена, либо заведена новая): серверные id глобальны,
+     * поэтому курсор прежнего треда пропустил бы строки нового, что старше его. Сверяется с
+     * [ApiClient.deviceRevision] перед слиянием любой страницы.
+     */
+    private var knownDeviceRevision = 0
+
     internal companion object {
         /** Периоды догона — те же, что у веб-виджета. `var` ради тестов (там 50 мс). */
         var managerPollIntervalMs = 6_000L
         var idlePollIntervalMs = 12_000L
         /** Потолок страниц за один догон: цикл не имеет права стать бесконечным. */
         const val MAX_CATCH_UP_PAGES = 5
+
+        /**
+         * RFC 4122 (версии 1–5) — ровно то, что принимает сервер. Строка ленты, заведённая
+         * хостом со своим id, уезжает старым путём (без `clientMessageId`), а не получает 400.
+         */
+        private val UUID_RE =
+            Regex("^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
     }
 
     /** Открыть сессию и подтянуть историю прошлого диалога (если он восстановлен сервером). */
@@ -148,6 +164,10 @@ class ChatController(
      */
     @MainThread
     fun retry() {
+        // Отправка уже идёт (двойной тап по «Повторить», либо пользователь успел написать
+        // ещё раз) — второй поток отменил бы первый и увёл его сообщение в «недоставленные».
+        // Закрытый диалог не принимает сообщений: запрос вернулся бы ошибкой.
+        if (store.sending || store.mode == ChatMode.Closed) return
         if (store.state.value.retryable == null) return
         store.setRetryable(null)
         val failed = store.messages.lastOrNull { it.failed && it.role == "user" } ?: return
@@ -261,11 +281,19 @@ class ChatController(
                 // оборвать его на полпути нечем, да и незачем: ответ просто отбрасывается.
                 // Паритет с iOS (`ChatController.catchUp`).
                 if (!currentCoroutineContext().isActive) return
+                reconcileDevice()
+                val revision = client.deviceRevision
                 val cursor = store.lastServerMessageId
                 val response = client.history(since = if (cursor > 0) cursor else null, limit = 50)
                 if (identityEpoch.get() != startedEpoch) return
+                // Устройство сменилось, пока шёл запрос: страница отобрана по курсору прежнего
+                // треда и полной не является — курсор сбрасывается, страница перечитывается.
+                if (client.deviceRevision != revision) {
+                    reconcileDevice()
+                    continue
+                }
                 store.setMode(response.mode)
-                store.mergeServerMessages(mapHistory(response.messages))
+                mergeHistory(historyBatch(response))
                 if (!response.hasMore) break
             }
             // Баннер снимаем, только если повторять нечего: иначе с экрана исчезла бы кнопка
@@ -304,15 +332,19 @@ class ChatController(
         // время отправки, не отличалась бы от провала в той же сессии.
         val sentInEpoch = identityEpoch.get()
 
+        // `clientMessageId` = id строки ленты: повтор берёт ту же строку, значит шлёт тот же id,
+        // и сервер не сохранит сообщение дважды и не оплатит второй ответ.
+        val clientMessageId = userMessageId.lowercase().takeIf { UUID_RE.matches(it) }
+
         streamJob = scope.launch {
-            // Сервер закончил ответ сам (`[DONE]`, ошибка, таймаут, рестарт) или поток дочитан —
-            // отличает завершённую отправку от оборванной отменой.
-            var serverFinished = false
+            // Итог потока: закончил ли сервер сам (`[DONE]`, ошибка, таймаут, рестарт) — отличает
+            // завершённую отправку от оборванной отменой — и дал ли он ответ.
+            val outcome = StreamOutcome()
             try {
-                client.sendMessage(text).collect {
-                    if (handle(it, userMessageId, placeholderId)) serverFinished = true
+                client.sendMessage(text, clientMessageId).collect {
+                    handle(it, userMessageId, placeholderId, outcome)
                 }
-                serverFinished = true
+                outcome.serverFinished = true
                 store.finalizeAssistant(placeholderId)
                 store.dropEmptyPlaceholder(placeholderId)
                 store.setSending(false)
@@ -320,11 +352,15 @@ class ChatController(
                 // отправленному сообщению и ответу. Без него первый тик поллинга принёс бы
                 // обе строки как «новые», и слияние держалось бы на совпадении текста.
                 catchUp(silent = true)
+                // Поток закрылся без ответа (`event: error` после сохранения сообщения, таймаут,
+                // плановый рестарт): сообщение на сервере есть, ответа нет — «Повторить»
+                // безопасен, повтор с тем же id ответ догенерирует.
+                if (!outcome.answered) offerRetryIfUnanswered(userMessageId, text, outcome.error)
             } catch (e: CancellationException) {
                 // Отмена приходит от stop() (экран закрыт, приложение ушло в фон), от новой
                 // отправки или от смены пользователя. Общий флаг отправки не трогаем — им уже
                 // владеет stop() или новая задача.
-                if (serverFinished || identityEpoch.get() != sentInEpoch) {
+                if (outcome.serverFinished || identityEpoch.get() != sentInEpoch) {
                     store.finalizeAssistant(placeholderId)
                     store.dropEmptyPlaceholder(placeholderId)
                 } else {
@@ -337,10 +373,38 @@ class ChatController(
         }
     }
 
-    /** @return `true` — событие завершает ответ со стороны сервера. */
-    private fun handle(event: ChatStreamEvent, userMessageId: String, placeholderId: String): Boolean {
+    /** Итог одного потока: см. использование в [run]. */
+    private class StreamOutcome {
+        /** Сервер закончил сам, а не был отменён изнутри приложения. */
+        var serverFinished = false
+        /** На сообщение пришёл ответ (ИИ дописал, ответил менеджер) — «Повторить» не нужен. */
+        var answered = false
+        /** Ошибка из потока: догон снимет баннер, а «Повторить» обязан вернуть его. */
+        var error: ChatError? = null
+    }
+
+    private fun handle(
+        event: ChatStreamEvent,
+        userMessageId: String,
+        placeholderId: String,
+        outcome: StreamOutcome,
+    ) {
         when (event) {
-            is ChatStreamEvent.Meta -> store.setMode(event.mode)
+            is ChatStreamEvent.Meta -> {
+                // Рукопожатие внутри отправки могло вернуть другое устройство: серверные строки
+                // прежнего треда уходят до того, как в ленту сядет подтверждённый id.
+                reconcileDevice()
+                store.setMode(event.mode)
+                val accepted = event.clientMessageId
+                val serverId = event.userMessageId
+                if (accepted != null && serverId != null) {
+                    store.markClientIdsSupported()
+                    // Приём подтверждён сервером: строка узнана по id, а не по тексту.
+                    if (accepted.equals(userMessageId, ignoreCase = true)) {
+                        store.confirmUserMessage(userMessageId, serverId)
+                    }
+                }
+            }
 
             is ChatStreamEvent.ContentDelta ->
                 store.updateAssistantContent(placeholderId, event.text)
@@ -349,12 +413,14 @@ class ChatController(
                 store.finalizeAssistant(placeholderId)
                 store.dropEmptyPlaceholder(placeholderId)
                 store.setSending(false)
-                return true
+                outcome.answered = true
+                outcome.serverFinished = true
             }
 
             is ChatStreamEvent.Manager -> {
                 store.appendOperatorMessage(event.message.text, event.message.authorName)
                 store.setOperatorTyping(null)
+                outcome.answered = true
             }
 
             is ChatStreamEvent.Escalation -> store.setMode(ChatMode.PendingEscalation)
@@ -368,14 +434,16 @@ class ChatController(
                 store.finalizeAssistant(placeholderId)
                 store.dropEmptyPlaceholder(placeholderId)
                 store.setSending(false)
-                store.setError(chatError(MeerBotError.Stream(event.code, event.message)))
-                return true
+                val error = chatError(MeerBotError.Stream(event.code, event.message))
+                store.setError(error)
+                outcome.error = error
+                outcome.serverFinished = true
             }
 
             is ChatStreamEvent.Timeout -> {
                 store.finalizeAssistant(placeholderId)
                 store.setSending(false)
-                return true
+                outcome.serverFinished = true
             }
 
             is ChatStreamEvent.Shutdown -> {
@@ -385,16 +453,48 @@ class ChatController(
                 // `fetchHistory` сверяет эпоху, а id прежней ленты в новой не найдутся.
                 store.finalizeAssistant(placeholderId)
                 store.setSending(false)
+                outcome.serverFinished = true
                 scope.launch {
                     runCatching { loadHistory() }
                     settleInterruptedReply(userMessageId, placeholderId)
                 }
-                return true
             }
 
             is ChatStreamEvent.Unknown -> Unit
         }
-        return false
+    }
+
+    /**
+     * Сервер сообщение принял (строка подтверждена по `clientMessageId`), но ответа так и нет:
+     * пользователю нужен «Повторить». Повтор идемпотентен — тот же id не сохранит сообщение
+     * второй раз, а ответ догенерирует, если его всё ещё нет.
+     *
+     * Ответ уже есть (или диалог ведёт человек — ответ придёт от него) — кнопка не нужна.
+     * Строка не подтверждена по id: старый сервер либо запрос не дошёл — решает прежнее правило
+     * по месту вызова.
+     */
+    private fun offerRetryIfUnanswered(userMessageId: String, text: String, error: ChatError? = null): Boolean {
+        if (!store.isIdConfirmed(userMessageId)) return false
+        if (store.isSettled(userMessageId)) return false
+        store.setFailed(userMessageId, true)
+        store.setRetryable(text)
+        // Догон между ошибкой и этой проверкой снимает баннер, если повторять было нечего.
+        if (error != null) store.setError(error)
+        return true
+    }
+
+    /**
+     * Рукопожатие вернуло другое устройство: серверные строки и курсор в ленте — из треда
+     * прежнего, и с ними догон пропустил бы часть нового треда (id сообщений глобальные).
+     *
+     * @return `true` — лента сброшена, историю нужно читать с нуля.
+     */
+    private fun reconcileDevice(): Boolean {
+        val revision = client.deviceRevision
+        if (revision == knownDeviceRevision) return false
+        knownDeviceRevision = revision
+        store.resetForDeviceChange()
+        return true
     }
 
     /**
@@ -417,6 +517,12 @@ class ChatController(
             store.removeMessage(placeholderId)
         }
         val message = store.messages.firstOrNull { it.id == userMessageId } ?: return
+        // Сервер подтвердил приём по `clientMessageId`: серверный id у строки есть, но ответа
+        // может не быть — тогда «Повторить» нужен, и он безопасен (тот же id).
+        if (store.isIdConfirmed(userMessageId)) {
+            offerRetryIfUnanswered(userMessageId, text)
+            return
+        }
         if (message.serverId != null) return
         store.setFailed(userMessageId, true)
         store.setRetryable(text)
@@ -458,12 +564,19 @@ class ChatController(
         // доставленное, замена ленты стирала его, и «Повторить» не было.
         // Диалога нет (сервер не прислал `meta`) — сообщение до него не дошло, и лишний запрос
         // истории ничего не решил бы (паритет с iOS).
-        val items = if (client.conversationId != null) runCatching { fetchHistory() }.getOrNull() else null
+        val batch = if (client.conversationId != null) runCatching { fetchHistory() }.getOrNull() else null
         // Пользователь сменился, пока шёл запрос: его новой ленте чужой «Повторить» не нужен.
         if (identityEpoch.get() != startedEpoch) return
-        if (items != null) {
-            store.mergeServerMessages(items)
+        if (batch != null) {
+            mergeHistory(batch)
             if (settleInterruptedReply(userMessageId, placeholderId)) return
+        }
+        // Строка подтверждена сервером по id: ответ есть — повторять нечего, ответа нет —
+        // «Повторить» с тем же id безопасен. Ошибка до подтверждения (409, обрыв до `meta`)
+        // сюда не попадает: ниже прежнее правило, и сообщение помечается недоставленным.
+        if (store.isIdConfirmed(userMessageId)) {
+            offerRetryIfUnanswered(userMessageId, text)
+            return
         }
 
         store.setFailed(userMessageId, true)
@@ -479,8 +592,8 @@ class ChatController(
      * сохраняет неподтверждённые строки, узнаёт эхо своих и ставит историю над ними.
      */
     private suspend fun loadHistory() {
-        val items = fetchHistory() ?: return
-        store.mergeServerMessages(items)
+        val batch = fetchHistory() ?: return
+        mergeHistory(batch)
     }
 
     /**
@@ -508,12 +621,37 @@ class ChatController(
      * Хвост треда с сервера (без курсора) — для слияния с лентой при старте и после обрыва.
      * `null` — пока шёл запрос, сменился пользователь, и страница принадлежит прежнему.
      */
-    private suspend fun fetchHistory(): List<ChatMessage>? {
+    private suspend fun fetchHistory(): HistoryBatch? {
         val startedEpoch = identityEpoch.get()
         val page = client.history()
         if (identityEpoch.get() != startedEpoch) return null
+        // Страница — уже от текущего устройства (запрос без курсора), поэтому серверные строки
+        // прежнего треда убираются перед слиянием, а не после.
+        reconcileDevice()
         store.setMode(page.mode)
-        return mapHistory(page.messages)
+        return historyBatch(page)
+    }
+
+    /** Страница истории, готовая к слиянию: строки и `clientMessageId` строк пользователя. */
+    private class HistoryBatch(
+        val items: List<ChatMessage>,
+        val clientIds: Map<Long, String>,
+        val clientIdsSupported: Boolean,
+    )
+
+    private fun historyBatch(page: HistoryPage) = HistoryBatch(
+        items = mapHistory(page.messages),
+        clientIds = page.messages.mapNotNull { item ->
+            item.clientMessageId?.let { item.id to it }
+        }.toMap(),
+        clientIdsSupported = page.clientMessageIdsSupported,
+    )
+
+    private fun mergeHistory(batch: HistoryBatch): Int {
+        // Признак поддержки — по наличию ключа у строк пользователя, даже пустого: только он
+        // говорит, что молчание сервера об id означает «строка не наша», а не «старый сервер».
+        if (batch.clientIdsSupported) store.markClientIdsSupported()
+        return store.mergeServerMessages(batch.items, batch.clientIds)
     }
 
     private fun mapHistory(items: List<HistoryMessage>): List<ChatMessage> =

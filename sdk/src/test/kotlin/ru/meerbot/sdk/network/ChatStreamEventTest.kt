@@ -95,6 +95,59 @@ class ChatStreamEventTest {
     }
 
     @Test
+    fun `meta несёт подтверждение приёма отправки`() {
+        val result = event(
+            "meta",
+            "{\"conversationId\":42,\"mode\":\"ai\",\"clientMessageId\":\"A1B2C3D4-1111-4222-8333-444455556666\"," +
+                "\"userMessageId\":501,\"replayed\":true}",
+        ) as ChatStreamEvent.Meta
+
+        // Id приводится к нижнему регистру: сервер хранит его так же, и сверка со строкой ленты
+        // не должна зависеть от регистра, в котором его вернули.
+        assertEquals("a1b2c3d4-1111-4222-8333-444455556666", result.clientMessageId)
+        assertEquals(501L, result.userMessageId)
+        assertTrue(result.replayed)
+    }
+
+    /** Старый сервер полей не знает: прежнее правило (сверка эха по тексту) обязано сохраниться. */
+    @Test
+    fun `meta без подтверждения оставляет поля пустыми`() {
+        val result = event("meta", "{\"conversationId\":42,\"mode\":\"ai\"}") as ChatStreamEvent.Meta
+
+        assertNull(result.clientMessageId)
+        assertNull(result.userMessageId)
+        assertEquals(false, result.replayed)
+    }
+
+    /** Половина подтверждения ничего не подтверждает: строка ленты осталась бы без серверного id. */
+    @Test
+    fun `meta с id без серверного номера подтверждением не считается`() {
+        val result = event(
+            "meta",
+            "{\"conversationId\":42,\"mode\":\"ai\",\"clientMessageId\":\"a1b2c3d4-1111-4222-8333-444455556666\"," +
+                "\"userMessageId\":null}",
+        ) as ChatStreamEvent.Meta
+
+        assertNull(result.clientMessageId)
+        assertNull(result.userMessageId)
+    }
+
+    /**
+     * Поля подтверждения — в теле класса: приложение, собранное против 0.2.8, сравнивает `Meta`
+     * прежним `equals`, и обновление SDK не имеет права его поменять.
+     */
+    @Test
+    fun `подтверждение не участвует в equals`() {
+        val withAcceptance = event(
+            "meta",
+            "{\"conversationId\":42,\"mode\":\"ai\",\"clientMessageId\":\"a1b2c3d4-1111-4222-8333-444455556666\"," +
+                "\"userMessageId\":501}",
+        )
+
+        assertEquals(ChatStreamEvent.Meta(42L, ChatMode.Ai), withAcceptance)
+    }
+
+    @Test
     fun `битый JSON не роняет разбор`() {
         val result = event("meta", "{не json")
         assertEquals(ChatStreamEvent.Meta(-1L, ChatMode.Ai), result)

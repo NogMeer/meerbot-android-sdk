@@ -29,6 +29,7 @@
     <string name="meerbot_err_invalid_response">Unexpected server response.</string>
     <string name="meerbot_err_cancelled">The request failed. Please try again.</string>
     <string name="meerbot_err_session_lost">The session is no longer valid. Reopen the chat.</string>
+    <string name="meerbot_err_generation_in_progress">The reply is still being prepared. Try again shortly.</string>
 
     <string name="meerbot_not_configured_title">MeerBot is not configured</string>
     <string name="meerbot_not_configured_body">Call MeerBot.configure(context, apiKey) on app start.</string>

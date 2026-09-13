@@ -27,6 +27,7 @@ import ru.meerbot.sdk.network.ApiClient
 import ru.meerbot.sdk.network.MeerBotConfiguration
 import ru.meerbot.sdk.testing.ScriptedDispatcher
 import java.time.Instant
+import java.util.concurrent.CopyOnWriteArrayList
 
 /** Дождаться состояния подпиской на StateFlow, а не опросом с паузами. */
 private fun awaitState(controller: ChatController, timeoutMs: Long, check: (ChatState) -> Boolean) {
@@ -1107,5 +1108,332 @@ class ChatControllerCatchUpTest {
 
         assertTrue(scope.coroutineContext.job.children.none { it.isActive })
         assertEquals(afterStop, server.requestCount)
+    }
+}
+
+/**
+ * Идемпотентная отправка: `clientMessageId` строки ленты, подтверждение приёма в `meta` и
+ * повтор тем же id.
+ *
+ * Сервер в этих тестах возвращает `clientMessageId` ЭХОМ из тела запроса — тест не подставляет
+ * его сам, иначе он проверял бы свою же подстановку, а не то, что клиент отправил id строки.
+ * Старый сервер (без полей подтверждения) проверяется отдельно: прежнее правило сверки по
+ * тексту обязано остаться в силе.
+ */
+class ChatControllerClientMessageIdTest {
+
+    private lateinit var server: MockWebServer
+    private lateinit var scope: CoroutineScope
+    private lateinit var dispatcher: ScriptedDispatcher
+
+    /** `clientMessageId`, пришедшие на сервер, в порядке отправок: повтор обязан прислать тот же. */
+    private val sentIds = CopyOnWriteArrayList<String>()
+
+    @Before
+    fun setUp() {
+        server = MockWebServer()
+        server.start()
+        dispatcher = ScriptedDispatcher().also { server.dispatcher = it }
+        scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    }
+
+    @After
+    fun tearDown() {
+        scope.cancel()
+        server.shutdown()
+    }
+
+    private fun apiClient(): ApiClient = ApiClient(
+        config = MeerBotConfiguration(
+            apiKey = "pk_live_mobile",
+            baseUrl = server.url("/").toString().trimEnd('/'),
+            sdkVersion = "0.2.9-test",
+        ),
+        visitorUuid = "11111111-1111-1111-1111-111111111111",
+        installationId = "and-22222222-2222-2222-2222-222222222222",
+    )
+
+    private fun started(client: ApiClient = apiClient()): ChatController {
+        val controller = ChatController(client = client, scope = scope)
+        controller.start()
+        awaitState(controller, 5_000) { it.ready }
+        return controller
+    }
+
+    private fun await(controller: ChatController, check: (ChatState) -> Boolean) =
+        awaitState(controller, 5_000, check)
+
+    /** Отвечать на поток по принятому `clientMessageId` и номеру попытки (начиная с первой). */
+    private fun respondToStream(response: (id: String, attempt: Int) -> MockResponse) {
+        dispatcher.streamResponder = { request ->
+            val id = JSONObject(request.body.readUtf8()).optString("clientMessageId")
+            sentIds += id
+            response(id, sentIds.size)
+        }
+    }
+
+    private fun metaAccepted(id: String, serverId: Long = 7L, replayed: Boolean = false) =
+        "event: meta\ndata: {\"conversationId\":3,\"mode\":\"ai\",\"clientMessageId\":\"$id\"," +
+            "\"userMessageId\":$serverId,\"replayed\":$replayed}\n\n"
+
+    private val answerFrames =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Здравствуйте\"}}]}\n\ndata: [DONE]\n\n"
+
+    /** Оборванный посреди тела поток: значимые кадры — в первой половине, дальше заполнитель. */
+    private fun brokenStream(frames: String) = ScriptedDispatcher.sse(
+        frames + "data: {\"choices\":[{\"delta\":{\"content\":\"нача\"}}]}\n\n" +
+            "event: heartbeat\ndata: {}\n\n".repeat(40),
+    ).setSocketPolicy(SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY)
+
+    /** Строка пользователя в истории: ключ `clientMessageId` есть всегда — сервер его знает. */
+    private fun userEcho(serverId: Long, clientId: String?, text: String = "привет") =
+        """{"id":$serverId,"role":"user","content":"$text","clientMessageId":${
+            clientId?.let { "\"$it\"" } ?: "null"
+        },"createdAt":"${iso()}"}"""
+
+    private fun answerRow(serverId: Long, text: String = "Здравствуйте") =
+        """{"id":$serverId,"role":"assistant","content":"$text","createdAt":"${iso()}"}"""
+
+    private fun historyOf(vararg rows: String, mode: String = "ai") =
+        ScriptedDispatcher.history(mode = mode, messages = rows.joinToString(","))
+
+    @Test
+    fun `отправка несёт id строки ленты, подтверждение сажает серверный id`() {
+        val controller = started()
+        respondToStream { id, _ -> ScriptedDispatcher.sse(metaAccepted(id) + answerFrames) }
+        dispatcher.historyFallback = { historyOf(userEcho(7L, sentIds.last()), answerRow(8L)) }
+
+        controller.send("привет")
+
+        await(controller) { s -> !s.sending && s.messages.any { it.serverId == 8L } }
+        val state = controller.state.value
+        val local = state.messages.single { it.role == "user" }
+        // Ушёл именно id строки ленты: повтор возьмёт ту же строку и пришлёт тот же id.
+        assertEquals(local.id, sentIds.single())
+        assertEquals(7L, local.serverId)
+        assertEquals(listOf("привет", "Здравствуйте"), state.messages.map { it.content })
+        assertTrue(state.messages.none { it.failed })
+        assertNull(state.retryable)
+    }
+
+    /**
+     * Обрыв после подтверждения приёма: сообщение на сервере есть, ответа нет. Пользователь
+     * обязан увидеть «Повторить», а повтор — уйти с тем же id: сервер не сохранит сообщение
+     * дважды и не оплатит второй ответ модели. Повторный ответ (`replayed`) рисуется один раз.
+     */
+    @Test
+    fun `обрыв после подтверждения приёма даёт повтор тем же id и один ответ`() {
+        val controller = started()
+        respondToStream { id, attempt ->
+            if (attempt == 1) brokenStream(metaAccepted(id))
+            else ScriptedDispatcher.sse(metaAccepted(id, replayed = true) + answerFrames)
+        }
+        dispatcher.historyFallback = { historyOf(userEcho(7L, sentIds.last())) }
+
+        controller.send("привет")
+
+        await(controller) { it.retryable != null }
+        val interrupted = controller.state.value
+        assertEquals("привет", interrupted.retryable)
+        val local = interrupted.messages.single { it.role == "user" }
+        assertEquals(7L, local.serverId)
+        assertTrue(local.failed)
+
+        dispatcher.historyFallback = { historyOf(userEcho(7L, sentIds.last()), answerRow(8L)) }
+        controller.retry()
+
+        await(controller) { s -> !s.sending && s.messages.any { it.serverId == 8L } }
+        val state = controller.state.value
+        assertEquals(2, sentIds.size)
+        assertEquals(sentIds[0], sentIds[1])
+        assertEquals(local.id, state.messages.single { it.role == "user" }.id)
+        // Повторный ответ сервера (`replayed`) рисуется ОДИН раз. Обрывок первой попытки
+        // («нача») в ленте остаётся — так было и до 0.2.9: полученный текст не выбрасывается.
+        assertEquals(listOf("привет", "нача", "Здравствуйте"), state.messages.map { it.content })
+        assertEquals(listOf(7L, null, 8L), state.messages.map { it.serverId })
+        assertEquals(1, state.messages.count { it.content == "Здравствуйте" })
+        assertTrue(state.messages.none { it.failed })
+        assertNull(state.retryable)
+    }
+
+    /**
+     * 409 `generation_in_progress`: ответ на это сообщение уже генерирует другой запрос. Строка
+     * узнаётся в истории по id, ответа пока нет — «Повторить» с понятным текстом. Пришедший
+     * ответ снимает и пометку, и кнопку сам, без действий пользователя.
+     */
+    @Test
+    fun `ответ ещё готовится — повтор предлагается, а пришедший ответ его снимает`() {
+        val api = apiClient()
+        val controller = started(api)
+        // Диалог открыт прошлым потоком: иначе история после ошибки не запрашивается.
+        api.rememberConversationId(3)
+        respondToStream { _, _ -> ScriptedDispatcher.error(409, "generation_in_progress") }
+        dispatcher.historyFallback = { historyOf(userEcho(7L, sentIds.last())) }
+
+        controller.send("привет")
+
+        await(controller) { it.retryable != null }
+        val waiting = controller.state.value
+        assertEquals("привет", waiting.retryable)
+        assertEquals(R.string.meerbot_err_generation_in_progress, waiting.connectionError?.messageRes)
+        val local = waiting.messages.single { it.role == "user" }
+        assertEquals(7L, local.serverId)
+        assertTrue(local.failed)
+
+        dispatcher.historyFallback = { historyOf(userEcho(7L, sentIds.last()), answerRow(8L)) }
+        controller.refresh()
+
+        await(controller) { s -> s.retryable == null && s.messages.any { it.serverId == 8L } }
+        val state = controller.state.value
+        assertTrue(state.messages.none { it.failed })
+        assertNull(state.connectionError)
+    }
+
+    /**
+     * `event: error` после того, как сервер сообщение сохранил: ответа нет, но отправлять второй
+     * раз нечего. «Повторить» безопасен, и баннер обязан вернуться — догон между ошибкой и
+     * проверкой его снимает.
+     */
+    @Test
+    fun `ошибка потока после сохранения сообщения оставляет повтор и баннер`() {
+        val controller = started()
+        respondToStream { id, _ ->
+            ScriptedDispatcher.sse(
+                metaAccepted(id) + "event: error\ndata: {\"code\":\"ai_unavailable\",\"message\":\"нет ИИ\"}\n\n",
+            )
+        }
+        dispatcher.historyFallback = { historyOf(userEcho(7L, sentIds.last())) }
+
+        controller.send("привет")
+
+        await(controller) { it.retryable != null }
+        val state = controller.state.value
+        assertEquals("привет", state.retryable)
+        assertEquals("ai_unavailable", state.connectionError?.code)
+        assertEquals(R.string.meerbot_err_ai_unavailable, state.connectionError?.messageRes)
+        assertTrue(state.messages.single { it.role == "user" }.failed)
+        assertTrue(!state.sending)
+    }
+
+    /** Диалог ведёт человек: ответ придёт от него, и «Повторить» на доставленном не нужен. */
+    @Test
+    fun `в режиме менеджера подтверждённое сообщение повтора не просит`() {
+        val controller = started()
+        respondToStream { id, _ ->
+            ScriptedDispatcher.sse(
+                metaAccepted(id) + "event: error\ndata: {\"code\":\"ai_unavailable\",\"message\":\"нет ИИ\"}\n\n",
+            )
+        }
+        dispatcher.historyFallback = { historyOf(userEcho(7L, sentIds.last()), mode = "human") }
+
+        controller.send("привет")
+
+        // Режим приходит из догона ПОСЛЕ потока, и решение о «Повторить» принимается сразу за
+        // ним, без ожиданий: дождавшись режима, состояние можно читать.
+        await(controller) { s -> !s.sending && s.mode == ChatMode.Human && s.messages.any { it.serverId == 7L } }
+        controller.stop()
+        awaitIdle(scope)
+        val state = controller.state.value
+        assertEquals(ChatMode.Human, state.mode)
+        assertNull(state.retryable)
+        assertTrue(state.messages.none { it.failed })
+    }
+
+    /**
+     * Старый сервер подтверждения не присылает и ключа `clientMessageId` в истории не знает:
+     * сверка по тексту остаётся единственным правилом, и поведение 0.2.8 сохраняется.
+     */
+    @Test
+    fun `старый сервер без подтверждения работает по прежнему правилу`() {
+        val controller = started()
+        respondToStream { _, _ ->
+            brokenStream("event: meta\ndata: {\"conversationId\":3,\"mode\":\"ai\"}\n\n")
+        }
+        dispatcher.historyFallback = {
+            ScriptedDispatcher.history(
+                messages = """{"id":7,"role":"user","content":"привет","createdAt":"${iso()}"},
+                   {"id":8,"role":"assistant","content":"Здравствуйте","createdAt":"${iso()}"}""",
+            )
+        }
+
+        controller.send("привет")
+
+        await(controller) { s -> s.messages.any { it.serverId == 8L } }
+        controller.stop()
+        awaitIdle(scope)
+        val state = controller.state.value
+        // Эхо узнано по тексту: сообщение доставлено, ответ дописан, дубля нет.
+        assertEquals(listOf("привет", "Здравствуйте"), state.messages.map { it.content })
+        assertEquals(listOf(7L, 8L), state.messages.map { it.serverId })
+        assertTrue(state.messages.none { it.failed })
+        assertNull(state.retryable)
+        // Id всё равно отправлен: сервер, который его не знает, поле игнорирует.
+        assertTrue(sentIds.single().isNotEmpty())
+    }
+
+    /**
+     * «Повторить» по устаревшему состоянию хоста: закрытый диалог сообщений не принимает, а во
+     * время отправки повтор отменил бы её же поток и увёл сообщение в недоставленные.
+     */
+    @Test
+    fun `повтор не уходит в закрытом диалоге и во время отправки`() {
+        val controller = started()
+        val gate = dispatcher.gateNextStream(ScriptedDispatcher.sse(answerFrames))
+        controller.store.setRetryable("привет")
+        controller.store.setMode(ChatMode.Closed)
+
+        controller.retry()
+
+        assertEquals(0, dispatcher.streamArrivalCount())
+        assertEquals("привет", controller.state.value.retryable)
+
+        controller.store.setMode(ChatMode.Ai)
+        controller.store.setSending(true)
+        controller.retry()
+
+        assertEquals(0, dispatcher.streamArrivalCount())
+        assertEquals("привет", controller.state.value.retryable)
+        gate.countDown()
+    }
+
+    /**
+     * Рукопожатие внутри отправки вернуло ДРУГОЕ устройство (отставная строка восстановлена,
+     * либо заведена новая): серверные id глобальны, поэтому курсор прежнего треда пропустил бы
+     * строки нового, что старше его. Лента прежнего треда уходит, история читается с нуля.
+     */
+    @Test
+    fun `другое устройство после рукопожатия перечитывает ленту с нуля`() {
+        dispatcher.historyFallback = {
+            ScriptedDispatcher.history(
+                messages = """{"id":90,"role":"assistant","content":"прежний тред","createdAt":"2026-08-14T10:00:00.000Z"}""",
+            )
+        }
+        val controller = started()
+        assertEquals(90L, controller.state.value.lastServerMessageId)
+
+        // Токен устарел посреди отправки: клиент переподключается, и сервер отдаёт другое устройство.
+        dispatcher.registerFallback = {
+            MockResponse().setBody(
+                """{"deviceId":"43","jwt":"jwt-2","expiresIn":900,"attestationRequired":false,"identity":{"status":"not_provided"}}""",
+            )
+        }
+        respondToStream { id, attempt ->
+            if (attempt == 1) ScriptedDispatcher.error(401, "jwt_expired")
+            else ScriptedDispatcher.sse(metaAccepted(id, serverId = 101L) + answerFrames)
+        }
+        dispatcher.clearArrivals()
+        dispatcher.historyFallback = { historyOf(userEcho(101L, sentIds.last()), answerRow(102L)) }
+
+        controller.send("привет")
+
+        await(controller) { s -> !s.sending && s.messages.any { it.serverId == 102L } }
+        val state = controller.state.value
+        // Строки прежнего треда ушли вместе с курсором; своя отправка осталась.
+        assertEquals(listOf("привет", "Здравствуйте"), state.messages.map { it.content })
+        assertEquals(listOf(101L, 102L), state.messages.map { it.serverId })
+        assertEquals(102L, state.lastServerMessageId)
+        // История после смены устройства запрашивается без курсора прежнего треда.
+        val paths = generateSequence { if (dispatcher.historyArrivalCount() > 0) dispatcher.awaitHistory().path else null }
+        assertTrue(paths.none { it.contains("since") })
     }
 }

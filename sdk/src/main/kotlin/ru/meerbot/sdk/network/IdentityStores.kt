@@ -42,6 +42,92 @@ internal class InMemorySubjectHashStore(hash: String? = null) : SubjectHashStore
     override var hash: String? = hash
 }
 
+/**
+ * Монотонный счётчик смен identity на этой установке (`identitySeq` рукопожатия).
+ *
+ * Сервер хранит максимум, пришедший с установки, и запрос с МЕНЬШИМ значением для identity
+ * игнорирует целиком — включая флаг выхода. Так порядок «выход → вход» задаётся счётчиком, а не
+ * часами бэкенда интегратора: задержанная регистрация со свежим токеном прежнего пользователя
+ * больше не отменяет выход, случившийся после неё.
+ *
+ * Счётчик растёт в той же критической секции, что и флаг выхода (любой выход и любая смена
+ * человека), и переживает перезапуск — иначе следующий запуск ушёл бы с меньшим значением, и
+ * сервер перестал бы принимать его identity вовсе.
+ */
+internal interface IdentitySeqStore {
+    val value: Long
+
+    /**
+     * Поднять счётчик на единицу и вернуть новое значение.
+     *
+     * @param durable дождаться записи на диск (выход: процесс могут убить сразу после вызова).
+     */
+    fun increment(durable: Boolean = false): Long
+
+    /**
+     * Поднять счётчик до [value], если он ниже: сервер сообщил в ответе `identity.seq` больше
+     * отправленного (локальный счётчик потерян со сбросом хранилища). Без этого все дальнейшие
+     * запросы установки были бы для сервера устаревшими, и identity не применилась бы никогда.
+     */
+    fun raiseTo(value: Long)
+}
+
+internal class InMemoryIdentitySeqStore(value: Long = 0L) : IdentitySeqStore {
+    private val lock = Any()
+
+    @Volatile
+    override var value: Long = value
+        private set
+
+    override fun increment(durable: Boolean): Long = synchronized(lock) {
+        value = nextSeq(value)
+        value
+    }
+
+    override fun raiseTo(value: Long) = synchronized(lock) {
+        if (value > this.value) this.value = clampSeq(value)
+    }
+}
+
+internal class PrefsIdentitySeqStore(
+    prefs: SharedPreferences,
+    onError: StoreErrorReporter = StoreErrorReporter.Logcat,
+) : IdentitySeqStore {
+    private val lock = Any()
+    private val stored = PrefsValue(
+        prefs = prefs,
+        key = KEY,
+        errorPrefix = "identity_seq",
+        default = 0L,
+        read = { key, default -> getLong(key, default) },
+        write = { key, value -> putLong(key, value) },
+        onError = onError,
+    )
+
+    override val value: Long get() = clampSeq(stored.get())
+
+    override fun increment(durable: Boolean): Long = synchronized(lock) {
+        val next = nextSeq(stored.get())
+        stored.set(next, durable = durable)
+        next
+    }
+
+    override fun raiseTo(value: Long) {
+        synchronized(lock) {
+            if (value > stored.get()) stored.set(clampSeq(value))
+        }
+    }
+
+    companion object {
+        const val KEY = "identity_seq"
+    }
+}
+
+/** Сервер принимает `identitySeq` в диапазоне `0..2147483647`: выше — 400. */
+private fun clampSeq(value: Long): Long = value.coerceIn(0L, Int.MAX_VALUE.toLong())
+
+private fun nextSeq(value: Long): Long = clampSeq(clampSeq(value) + 1)
+
 /** Куда сообщать о сбое хранилища. Код — машинный, для поиска в логах хоста. */
 internal fun interface StoreErrorReporter {
     fun report(code: String, error: Throwable)

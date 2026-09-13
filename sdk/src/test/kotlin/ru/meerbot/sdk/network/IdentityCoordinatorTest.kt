@@ -16,12 +16,15 @@ class IdentityCoordinatorTest {
     private val prefs = FakeSharedPreferences()
     private var feedResets = 0
 
-    private fun client(flag: LogoutFlagStore) = ApiClient(
+    private val seq = InMemoryIdentitySeqStore()
+
+    private fun client(flag: LogoutFlagStore, seqStore: IdentitySeqStore = seq) = ApiClient(
         MeerBotConfiguration(apiKey = "pk_live_mobile", baseUrl = "http://127.0.0.1:9", sdkVersion = "0.2.9-test"),
         "11111111-1111-1111-1111-111111111111",
         INSTALLATION,
         ApiClient.defaultHttpClient(),
         flag,
+        seqStore,
     )
 
     /** Как `configure`: новый клиент поверх тех же prefs — это и есть «после перезапуска». */
@@ -160,6 +163,36 @@ class IdentityCoordinatorTest {
         assertEquals(IdentityChange.Switch, identity.apply(Jwt.withSub("user-A")))
         assertTrue(flag.pending)
         assertEquals(3, feedResets)
+    }
+
+    /**
+     * Счётчик растёт в той же критической секции, что флаг выхода: сервер упорядочивает выходы
+     * и входы по нему, а не по часам бэкенда интегратора. Свежий токен того же человека порядок
+     * не меняет — там счётчик стоит на месте, иначе следующий запрос объявил бы устаревшим
+     * рукопожатие, ушедшее параллельно.
+     */
+    @Test
+    fun `счётчик identity растёт на смене и выходе, но не на обновлении токена`() {
+        val flag = InMemoryLogoutFlagStore()
+        val identity = coordinator(flag, client(flag))
+
+        identity.apply(Jwt.withSub("user-A", iat = 1))
+        assertEquals(1L, seq.value)
+
+        identity.apply(Jwt.withSub("user-A", iat = 2))
+        assertEquals(1L, seq.value)
+
+        identity.apply(Jwt.withSub("user-B"))
+        assertEquals(2L, seq.value)
+
+        identity.apply(null)
+        assertTrue(seq.value > 2L)
+        val afterLogout = seq.value
+
+        // Вход после выхода — всегда смена (кто войдёт, SDK не знает): его счётчик выше, и
+        // задержавшийся выход не имеет права отвязать уже связанного человека.
+        identity.apply(Jwt.withSub("user-A"))
+        assertTrue(seq.value > afterLogout)
     }
 
     private companion object {

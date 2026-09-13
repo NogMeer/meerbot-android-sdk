@@ -126,6 +126,68 @@ class ChatStore {
     @Volatile
     private var cursorKnown = false
 
+    /**
+     * Строки пользователя, чей серверный id подтверждён по `clientMessageId` (кадр `meta` или
+     * история), а не угадан по тексту. Для них не нужны ни пороги эха, ни сверка времени: сервер
+     * сам сказал, какая строка — эта отправка. Не в [ChatMessage]: см. [echoFloors].
+     */
+    private val idConfirmed: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
+    /**
+     * Сервер знает `clientMessageId` (пришёл `meta` с ним или история с ключом у строк
+     * пользователя). Тогда строку пользователя узнают ТОЛЬКО по id: чужая строка с тем же текстом
+     * (второе «да», сообщение с другого устройства) своей больше не станет. Не сбрасывается —
+     * сервер обратно не откатывается, а сброс вернул бы угадывание по тексту.
+     */
+    @Volatile
+    private var clientIdsSupported = false
+
+    internal fun markClientIdsSupported() {
+        clientIdsSupported = true
+    }
+
+    internal fun isIdConfirmed(localId: String): Boolean = localId in idConfirmed
+
+    /**
+     * Сервер подтвердил приём отправки [localId] под номером [serverId] (`meta` с
+     * `clientMessageId`). Курсор не двигается: строки между прежним курсором и этой принесёт
+     * догон. Пометку «не отправлено» не трогает — её снимает слияние, когда на сообщение есть
+     * ответ (см. [isSettled]). Серверная копия той же строки, уже влитая догоном, убирается.
+     */
+    internal fun confirmUserMessage(localId: String, serverId: Long) {
+        var confirmed = false
+        _state.update { current ->
+            confirmed = current.messages.any { it.id == localId && it.role == "user" }
+            if (!confirmed) return@update current
+            current.copy(
+                messages = current.messages
+                    .filterNot { it.serverId == serverId && it.id != localId }
+                    .map { if (it.id == localId) it.copy(serverId = serverId) else it },
+            )
+        }
+        if (confirmed) {
+            idConfirmed += localId
+            echoFloors.remove(localId)
+        }
+    }
+
+    /**
+     * На сообщение [localId] уже есть реакция сервера: после него в ленте есть более новая
+     * серверная строка (ответ, либо следующее сообщение, отменившее ответ на это), или диалог
+     * ведёт менеджер — ответ придёт от человека, повтор ничего не ускорит.
+     */
+    internal fun isSettled(localId: String): Boolean {
+        val current = _state.value
+        val message = current.messages.firstOrNull { it.id == localId } ?: return false
+        return isSettled(message, current.messages, current.mode)
+    }
+
+    private fun isSettled(message: ChatMessage, messages: List<ChatMessage>, mode: ChatMode): Boolean {
+        if (mode == ChatMode.Human || mode == ChatMode.PendingEscalation) return true
+        val serverId = message.serverId ?: return false
+        return messages.any { (it.serverId ?: 0L) > serverId }
+    }
+
     fun appendUserMessage(content: String): ChatMessage {
         val msg = ChatMessage(role = "user", content = content)
         _state.update { it.copy(messages = it.messages + msg) }
@@ -202,8 +264,11 @@ class ChatStore {
     }
 
     /** Убрать сообщение из ленты (недописанный пузырь, когда серверная версия ответа уже в ней). */
-    internal fun removeMessage(id: String) = _state.update { current ->
-        current.copy(messages = current.messages.filterNot { it.id == id })
+    internal fun removeMessage(id: String) {
+        _state.update { current ->
+            current.copy(messages = current.messages.filterNot { it.id == id })
+        }
+        idConfirmed.remove(id)
     }
 
     val lastServerMessageId: Long get() = _state.value.lastServerMessageId
@@ -219,6 +284,8 @@ class ChatStore {
         _state.update {
             it.copy(messages = items, lastServerMessageId = bumpCursor(it.lastServerMessageId, items))
         }
+        val kept = items.mapTo(HashSet()) { it.id }
+        idConfirmed.retainAll(kept)
         cursorKnown = true
     }
 
@@ -247,31 +314,58 @@ class ChatStore {
      * Курсор двигается ВСЕГДА, даже если вся страница пропущена: иначе следующий догон
      * запросил бы те же строки и цикл никогда бы не сдвинулся.
      *
+     * Сервер знает `clientMessageId` — см. перегрузку с `clientIds`.
+     *
      * @return сколько сообщений реально появилось в ленте.
      */
-    fun mergeServerMessages(items: List<ChatMessage>): Int {
+    fun mergeServerMessages(items: List<ChatMessage>): Int = mergeServerMessages(items, emptyMap())
+
+    /**
+     * Слияние с `clientMessageId` строк пользователя: [clientIds] — серверный id → id клиента.
+     *
+     * Строка с `clientMessageId` промоутит ТОЛЬКО локальную строку пользователя с тем же id (без
+     * учёта регистра) — без сверки текста, порога эха, часов и стриминга; пометка «не отправлено»
+     * остаётся (её снимает нормализация ниже). Нет такой локальной строки — строка не наша и по
+     * тексту не сверяется. Строка пользователя без id на сервере, который id знает, — тоже не
+     * наша. Сверка по тексту остаётся для ответов ассистента и для старого сервера.
+     *
+     * Нормализация после слияния: подтверждённая по id строка, на которую уже есть реакция
+     * сервера ([isSettled]), доставлена — пометка и «Повторить» снимаются. Без реакции пометка
+     * остаётся: повтор с тем же id безопасен (сервер не сохранит сообщение дважды и догенерирует
+     * ответ, только если его нет).
+     */
+    internal fun mergeServerMessages(items: List<ChatMessage>, clientIds: Map<Long, String>): Int {
         var added = 0
+        var confirmedNow: List<String> = emptyList()
         _state.update { current ->
             val merged = current.messages.toMutableList()
             val recognized = HashSet<Int>()
+            val confirmed = ArrayList<String>()
+            val byIdOnly = clientIdsSupported
             for (index in items.indices.reversed()) {
                 val item = items[index]
                 if (item.serverId != null && merged.any { it.serverId == item.serverId }) {
                     recognized += index
                     continue
                 }
+                val clientId = item.serverId?.let { clientIds[it] }
+                if (clientId != null) {
+                    val localIdx = merged.indexOfFirst {
+                        it.serverId == null && it.role == "user" && it.id.equals(clientId, ignoreCase = true)
+                    }
+                    if (localIdx >= 0) {
+                        merged[localIdx] = merged[localIdx].copy(serverId = item.serverId)
+                        confirmed += merged[localIdx].id
+                        recognized += index
+                    }
+                    continue
+                }
+                if (byIdOnly && item.role == "user") continue
                 val localIdx = indexOfLocalTwin(merged, item)
                 if (localIdx >= 0) {
                     merged[localIdx] = merged[localIdx].copy(serverId = item.serverId, failed = false)
                     recognized += index
                 }
-            }
-            // «Повторить» следует за последней ещё недоставленной строкой, а если таких не
-            // осталось — снимается: повтор отправил бы доставленное второй раз. Сверка по тексту
-            // здесь не годится — эхо более нового из двух недоставленных снимало бы кнопку и у
-            // старого, который так и не дошёл. Паритет с iOS `mergeServerPage`.
-            val retryable = current.retryable?.let {
-                merged.lastOrNull { m -> m.failed && m.role == "user" }?.content
             }
 
             // Счётчик — локальный: `update` может перезапустить лямбду при гонке записи.
@@ -283,12 +377,32 @@ class ChatStore {
                 merged.add(insertionIndex(merged, item), item)
                 inserted++
             }
+
+            // Реакция сервера ищется по ленте ПОСЛЕ вставки: ответ обычно приходит той же страницей.
+            for (i in merged.indices) {
+                val m = merged[i]
+                if (m.failed && (m.id in idConfirmed || m.id in confirmed) && isSettled(m, merged, current.mode)) {
+                    merged[i] = m.copy(failed = false)
+                }
+            }
+            // «Повторить» следует за последней ещё недоставленной строкой, а если таких не
+            // осталось — снимается: повтор отправил бы доставленное второй раз. Сверка по тексту
+            // здесь не годится — эхо более нового из двух недоставленных снимало бы кнопку и у
+            // старого, который так и не дошёл. Паритет с iOS `mergeServerPage`.
+            val retryable = current.retryable?.let {
+                merged.lastOrNull { m -> m.failed && m.role == "user" }?.content
+            }
             added = inserted
+            confirmedNow = confirmed
             current.copy(
                 messages = merged,
                 retryable = retryable,
                 lastServerMessageId = bumpCursor(current.lastServerMessageId, items),
             )
+        }
+        confirmedNow.forEach {
+            idConfirmed += it
+            echoFloors.remove(it)
         }
         cursorKnown = true
         return added
@@ -333,6 +447,8 @@ class ChatStore {
      * до отправки, доставкой не считается.
      */
     internal fun isAfterSend(localId: String, serverId: Long): Boolean {
+        // Подтверждено сервером по id — порог не нужен: это именно эта отправка.
+        if (localId in idConfirmed) return true
         val floor = echoFloors[localId]
         return floor == null || serverId > floor
     }
@@ -363,6 +479,7 @@ class ChatStore {
         cursorKnown = false
         _state.value = ChatState()
         echoFloors.clear()
+        idConfirmed.clear()
     }
 
     /**
@@ -373,6 +490,30 @@ class ChatStore {
         cursorKnown = false
         _state.update { ChatState(greeting = it.greeting) }
         echoFloors.clear()
+        idConfirmed.clear()
+    }
+
+    /**
+     * Рукопожатие вернуло другое устройство (тот же человек, но отставная строка восстановлена
+     * или заведена новая): серверные строки и курсор относятся к треду прежнего устройства и
+     * уходят, догон загрузит историю заново с нуля. Без сброса `since=` по курсору прежнего треда
+     * пропустил бы строки нового, что старше курсора, — id сообщений глобальные.
+     *
+     * Неподтверждённые строки (отправляемое, недоставленное) остаются: пропасть молча они не
+     * вправе, а своё эхо узнают в новой истории. Пороги эха остаются — они нижние границы по
+     * глобальным id и верны для любого треда.
+     */
+    internal fun resetForDeviceChange() {
+        cursorKnown = false
+        _state.update { current ->
+            val kept = current.messages.filter { it.serverId == null }
+            current.copy(
+                messages = kept,
+                lastServerMessageId = 0L,
+                retryable = current.retryable?.let { kept.lastOrNull { m -> m.failed && m.role == "user" }?.content },
+            )
+        }
+        idConfirmed.clear()
     }
 
     private companion object {

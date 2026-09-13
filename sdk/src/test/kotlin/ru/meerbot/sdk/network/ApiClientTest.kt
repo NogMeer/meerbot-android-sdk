@@ -47,7 +47,10 @@ class ApiClientTest {
         server.shutdown()
     }
 
-    private fun client(logoutFlag: LogoutFlagStore = InMemoryLogoutFlagStore()) = ApiClient(
+    private fun client(
+        logoutFlag: LogoutFlagStore = InMemoryLogoutFlagStore(),
+        seq: IdentitySeqStore = InMemoryIdentitySeqStore(),
+    ) = ApiClient(
         config = MeerBotConfiguration(
             apiKey = "pk_live_mobile",
             baseUrl = server.url("/").toString().trimEnd('/'),
@@ -57,6 +60,7 @@ class ApiClientTest {
         installationId = INSTALLATION,
         httpClient = ApiClient.defaultHttpClient(),
         logoutFlag = logoutFlag,
+        identitySeq = seq,
     )
 
     /** Сервер с воротами: ответ рукопожатия уходит только по сигналу теста. */
@@ -1007,8 +1011,269 @@ class ApiClientTest {
         assertEquals("network_io", (error as MeerBotError).code)
     }
 
+    // ─── Счётчик identity ─────────────────────────────────────────────────────────────────
+
+    @Test
+    fun `рукопожатие несёт счётчик identity, и выход его поднимает`() = runBlocking {
+        server.enqueue(registerResponse())
+        server.enqueue(registerResponse(jwt = "jwt-2"))
+        val seq = InMemoryIdentitySeqStore()
+        val api = client(seq = seq)
+
+        api.openSession()
+        // Ноль тоже отправляется: сервер отличает клиента, который умеет порядок, от старого.
+        assertEquals(0L, registerBody().getLong("identitySeq"))
+
+        api.logout()
+        api.openSession()
+
+        assertEquals(seq.value, registerBody().getLong("identitySeq"))
+        assertTrue(seq.value > 0L)
+    }
+
+    /**
+     * Локальный счётчик потерян (данные приложения стёрли без `reset()`): сервер сообщает свой,
+     * и запрос, который он счёл устаревшим, ни токен, ни выход не применил. Сессию сохранять
+     * нельзя — повтор уходит с догнанным счётчиком.
+     */
+    @Test
+    fun `серверный счётчик больше отправленного — попытка отброшена, повтор уходит с ним`() = runBlocking {
+        server.enqueue(
+            MockResponse().setBody(
+                """{"deviceId":"42","jwt":"jwt-stale","expiresIn":900,"identity":{"status":"not_provided","seq":5}}"""
+            ),
+        )
+        server.enqueue(registerResponse(jwt = "jwt-fresh"))
+        val seq = InMemoryIdentitySeqStore()
+
+        val session = client(seq = seq).openSession()
+
+        assertEquals("jwt-fresh", session.jwt)
+        assertEquals(5L, seq.value)
+        assertEquals(0L, registerBody().getLong("identitySeq"))
+        assertEquals(5L, registerBody().getLong("identitySeq"))
+    }
+
+    @Test
+    fun `серверный счётчик не больше отправленного сессию не отбрасывает`() = runBlocking {
+        server.enqueue(
+            MockResponse().setBody(
+                """{"deviceId":"42","jwt":"jwt-1","expiresIn":900,"identity":{"status":"linked","seq":3}}"""
+            ),
+        )
+        val seq = InMemoryIdentitySeqStore()
+        seq.raiseTo(3L)
+
+        assertEquals("jwt-1", client(seq = seq).openSession().jwt)
+        assertEquals(1, server.requestCount)
+        assertEquals(3L, seq.value)
+    }
+
+    /** Выход пишется на диск синхронно — вместе со счётчиком: их порядок и есть весь протокол. */
+    @Test
+    fun `запись выхода на диск поднимает счётчик синхронно`() {
+        val prefs = FakeSharedPreferences()
+        val api = client(logoutFlag = PrefsLogoutFlagStore(prefs), seq = PrefsIdentitySeqStore(prefs))
+
+        api.persistLogoutIntent()
+
+        assertEquals(1L, prefs.values[PrefsIdentitySeqStore.KEY])
+        // Два синхронных записи: счётчик и флаг. Отложенных нет — процесс могут убить сразу.
+        assertEquals(2, prefs.commits)
+        assertEquals(0, prefs.applies)
+    }
+
+    // ─── Временный отказ сервера (503) ────────────────────────────────────────────────────
+
+    @Test
+    fun `рукопожатие после 503 повторяется один раз с паузой из Retry-After`() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(503).setHeader("Retry-After", "2").setBody("""{"error":{"code":"registration_conflict"}}"""))
+        server.enqueue(registerResponse(jwt = "jwt-after-503"))
+        val api = client()
+        val delays = mutableListOf<Long>()
+        api.unavailableRetryDelay = { delays += it }
+
+        assertEquals("jwt-after-503", api.openSession().jwt)
+
+        assertEquals(2, server.requestCount)
+        assertEquals(1, delays.size)
+        // Пауза — из заголовка плюс разброс, а не сон наугад.
+        assertTrue("пауза ${delays[0]}", delays[0] in 2_000L..2_250L)
+    }
+
+    @Test
+    fun `второй 503 подряд отдаётся ошибкой вызывающему`() = runBlocking {
+        repeat(2) { server.enqueue(MockResponse().setResponseCode(503).setBody("""{"error":{"code":"registration_conflict"}}""")) }
+        val api = client()
+        val delays = mutableListOf<Long>()
+        api.unavailableRetryDelay = { delays += it }
+
+        val error = runCatching { api.openSession() }.exceptionOrNull()
+
+        assertEquals(503, (error as MeerBotError.Http).status)
+        assertEquals(2, server.requestCount)
+        assertEquals(1, delays.size)
+    }
+
+    @Test
+    fun `пауза после 503 — секунда без заголовка и не больше пяти секунд с ним`() {
+        assertTrue(ApiClient.unavailableDelayMs(null) in 1_000L..1_250L)
+        assertTrue(ApiClient.unavailableDelayMs("0") in 0L..250L)
+        assertTrue(ApiClient.unavailableDelayMs("3") in 3_000L..3_250L)
+        // Потолок: держать отправку минуту нельзя.
+        assertTrue(ApiClient.unavailableDelayMs("60") in 5_000L..5_250L)
+        // HTTP-дата вместо секунд и мусор — умолчание, а не ноль и не падение.
+        assertTrue(ApiClient.unavailableDelayMs("Wed, 21 Oct 2026 07:28:00 GMT") in 1_000L..1_250L)
+        assertTrue(ApiClient.unavailableDelayMs("-5") in 0L..250L)
+    }
+
+    @Test
+    fun `поток после 503 повторяется один раз и не теряет clientMessageId`() = runBlocking {
+        server.enqueue(registerResponse())
+        server.enqueue(MockResponse().setResponseCode(503).setHeader("Retry-After", "1").setBody("""{"error":{"code":"ai_unavailable"}}"""))
+        server.enqueue(sse("event: meta\ndata: {\"conversationId\":7,\"mode\":\"ai\"}\n\ndata: [DONE]\n\n"))
+        val api = client()
+        val delays = mutableListOf<Long>()
+        api.unavailableRetryDelay = { delays += it }
+
+        val events = api.sendMessage("привет", CLIENT_ID).toList()
+
+        assertEquals(2, events.size)
+        assertEquals(1, delays.size)
+        server.takeRequest() // рукопожатие
+        assertEquals(CLIENT_ID, JSONObject(server.takeRequest().body.readUtf8()).getString("clientMessageId"))
+        assertEquals(CLIENT_ID, JSONObject(server.takeRequest().body.readUtf8()).getString("clientMessageId"))
+    }
+
+    @Test
+    fun `второй 503 в потоке отдаётся ошибкой`() = runBlocking {
+        server.enqueue(registerResponse())
+        repeat(2) { server.enqueue(MockResponse().setResponseCode(503).setBody("""{"error":{"code":"ai_unavailable"}}""")) }
+        val api = client()
+        api.unavailableRetryDelay = { }
+
+        val error = runCatching { api.sendMessage("привет", CLIENT_ID).toList() }.exceptionOrNull()
+
+        assertEquals(503, (error as MeerBotError.Http).status)
+        assertEquals(3, server.requestCount)
+    }
+
+    // ─── Идемпотентная отправка ───────────────────────────────────────────────────────────
+
+    @Test
+    fun `публичная отправка идёт без clientMessageId`() = runBlocking {
+        server.enqueue(registerResponse())
+        server.enqueue(sse("data: [DONE]\n\n"))
+
+        client().sendMessage("привет").toList()
+
+        server.takeRequest()
+        assertFalse(JSONObject(server.takeRequest().body.readUtf8()).has("clientMessageId"))
+    }
+
+    /** Повтор после переподключения — тот же id: иначе сервер сохранил бы сообщение дважды. */
+    @Test
+    fun `повтор после протухшего токена несёт тот же clientMessageId`() = runBlocking {
+        server.enqueue(registerResponse(jwt = "jwt-old"))
+        server.enqueue(errorResponse(401, "jwt_expired"))
+        server.enqueue(registerResponse(jwt = "jwt-new"))
+        server.enqueue(sse("data: [DONE]\n\n"))
+
+        client().sendMessage("привет", CLIENT_ID).toList()
+
+        assertEquals(4, server.requestCount)
+        server.takeRequest()
+        val first = server.takeRequest()
+        server.takeRequest()
+        val second = server.takeRequest()
+        assertEquals(CLIENT_ID, JSONObject(first.body.readUtf8()).getString("clientMessageId"))
+        assertEquals("Bearer jwt-old", first.getHeader("Authorization"))
+        assertEquals(CLIENT_ID, JSONObject(second.body.readUtf8()).getString("clientMessageId"))
+        assertEquals("Bearer jwt-new", second.getHeader("Authorization"))
+    }
+
+    @Test
+    fun `история несёт clientMessageId строк пользователя`() = runBlocking {
+        server.enqueue(registerResponse())
+        server.enqueue(
+            MockResponse().setBody(
+                """{"messages":[
+                   {"id":1,"role":"user","content":"привет","clientMessageId":"A1B2C3D4-1111-4222-8333-444455556666","createdAt":"2026-08-14T10:00:00.000Z"},
+                   {"id":2,"role":"user","content":"старое","clientMessageId":null,"createdAt":"2026-08-14T10:00:01.000Z"},
+                   {"id":3,"role":"assistant","content":"на связи","createdAt":"2026-08-14T10:00:02.000Z"}
+                ],"hasMore":false,"mode":"ai"}"""
+            )
+        )
+
+        val page = client().history()
+
+        assertEquals(CLIENT_ID, page.messages[0].clientMessageId)
+        // Строка старого сервера ключ несёт пустым — поддержка от этого не пропадает.
+        assertNull(page.messages[1].clientMessageId)
+        assertNull(page.messages[2].clientMessageId)
+        assertTrue(page.clientMessageIdsSupported)
+    }
+
+    @Test
+    fun `история старого сервера поддержки не заявляет`() = runBlocking {
+        server.enqueue(registerResponse())
+        server.enqueue(
+            MockResponse().setBody(
+                """{"messages":[
+                   {"id":1,"role":"user","content":"привет","createdAt":"2026-08-14T10:00:00.000Z"},
+                   {"id":2,"role":"assistant","content":"на связи","createdAt":"2026-08-14T10:00:01.000Z"}
+                ],"hasMore":false,"mode":"ai"}"""
+            )
+        )
+
+        val page = client().history()
+
+        assertFalse(page.clientMessageIdsSupported)
+        assertNull(page.messages[0].clientMessageId)
+    }
+
+    // ─── Другое устройство в ответе ───────────────────────────────────────────────────────
+
+    /**
+     * Сервер завёл другую строку устройства (восстановил отставную, отвязал прежнюю): тред у неё
+     * другой, а id сообщений глобальные — курсор прежнего треда пропустил бы часть нового.
+     */
+    @Test
+    fun `другое устройство в ответе поднимает ревизию и сбрасывает диалог`() = runBlocking {
+        server.enqueue(registerResponse())
+        server.enqueue(MockResponse().setBody("""{"deviceId":"43","jwt":"jwt-2","expiresIn":900,"identity":{"status":"linked"}}"""))
+        val api = client()
+
+        api.openSession()
+        api.rememberConversationId(77)
+        assertEquals(0, api.deviceRevision)
+
+        api.invalidateToken()
+        api.openSession()
+
+        assertEquals(1, api.deviceRevision)
+        assertNull(api.conversationId)
+    }
+
+    @Test
+    fun `то же устройство ревизию не двигает`() = runBlocking {
+        server.enqueue(registerResponse())
+        server.enqueue(registerResponse(jwt = "jwt-2"))
+        val api = client()
+
+        api.openSession()
+        api.rememberConversationId(77)
+        api.invalidateToken()
+        api.openSession()
+
+        assertEquals(0, api.deviceRevision)
+        assertEquals(77L, api.conversationId)
+    }
+
     private companion object {
         const val VISITOR = "11111111-1111-1111-1111-111111111111"
+        /** UUID v4 в нижнем регистре — ровно то, что принимает сервер. */
+        const val CLIENT_ID = "a1b2c3d4-1111-4222-8333-444455556666"
         const val INSTALLATION = "and-22222222-2222-2222-2222-222222222222"
     }
 }

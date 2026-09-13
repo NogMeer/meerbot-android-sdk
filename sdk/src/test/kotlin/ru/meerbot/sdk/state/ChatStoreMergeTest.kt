@@ -421,6 +421,197 @@ class ChatStoreMergeTest {
         assertEquals(0L, store.lastServerMessageId)
     }
 
+    // ─── Узнавание по clientMessageId ─────────────────────────────────────────────────────
+
+    /**
+     * Сервер сказал, какая строка — эта отправка. Ни текст, ни порог эха, ни часы устройства
+     * больше не участвуют: отредактированный сервером текст и «вчерашняя» метка времени не имеют
+     * права превратить свою строку в чужую.
+     */
+    @Test
+    fun `строка узнаётся по id вопреки тексту, порогу и часам`() {
+        val store = ChatStore()
+        store.markClientIdsSupported()
+        store.mergeServerMessages(listOf(serverMessage(40, text = "старое")))
+        val local = store.appendUserMessage("да")
+        store.setFailed(local.id, true)
+
+        val added = store.mergeServerMessages(
+            // Регистр другой, текст другой, метка старше порога — id важнее всего этого.
+            listOf(serverMessage(41, role = "user", text = "ДА, конечно", at = yesterday)),
+            mapOf(41L to local.id.uppercase()),
+        )
+
+        assertEquals(0, added)
+        assertEquals(41L, store.messages.last().serverId)
+        assertEquals(local.id, store.messages.last().id)
+        assertTrue(store.isIdConfirmed(local.id))
+        // Пометку снимает не узнавание, а появившийся ответ: сервер сообщение принял, но
+        // ответа может не быть, и «Повторить» тогда нужен.
+        assertTrue(store.messages.last().failed)
+    }
+
+    /** Два «да» подряд: по тексту они неразличимы, по id — нет. */
+    @Test
+    fun `две одинаковые строки различаются по id`() {
+        val store = ChatStore()
+        store.markClientIdsSupported()
+        val first = store.appendUserMessage("да")
+        val second = store.appendUserMessage("да")
+
+        store.mergeServerMessages(
+            listOf(
+                serverMessage(10, role = "user", text = "да"),
+                serverMessage(11, role = "user", text = "да"),
+            ),
+            mapOf(10L to first.id, 11L to second.id),
+        )
+
+        assertEquals(listOf(10L, 11L), store.messages.map { it.serverId })
+        assertEquals(listOf(first.id, second.id), store.messages.map { it.id })
+    }
+
+    /** Сообщение с другого устройства того же человека: текст тот же, а строка чужая. */
+    @Test
+    fun `чужой id по тексту не подбирается`() {
+        val store = ChatStore()
+        store.markClientIdsSupported()
+        val local = store.appendUserMessage("да")
+
+        val added = store.mergeServerMessages(
+            listOf(serverMessage(12, role = "user", text = "да")),
+            mapOf(12L to "ffffffff-1111-4222-8333-444455556666"),
+        )
+
+        assertEquals(1, added)
+        assertEquals(2, store.messages.size)
+        assertNull(store.messages.first { it.id == local.id }.serverId)
+        assertFalse(store.isIdConfirmed(local.id))
+    }
+
+    /**
+     * Сервер знает `clientMessageId`, а у строки его нет — значит строка не наша (старая, либо с
+     * другого устройства). Сверка по тексту здесь вернула бы ту самую ошибку, от которой id и
+     * спасает.
+     */
+    @Test
+    fun `строка пользователя без id по тексту не подбирается на поддерживающем сервере`() {
+        val store = ChatStore()
+        store.markClientIdsSupported()
+        val local = store.appendUserMessage("да")
+
+        val added = store.mergeServerMessages(listOf(serverMessage(13, role = "user", text = "да")))
+
+        assertEquals(1, added)
+        assertNull(store.messages.first { it.id == local.id }.serverId)
+    }
+
+    /** Ответ ассистента id не несёт никогда: его строка узнаётся по тексту и на новом сервере. */
+    @Test
+    fun `ответ ассистента узнаётся по тексту и при поддержке id`() {
+        val store = ChatStore()
+        store.markClientIdsSupported()
+        val placeholder = store.appendAssistantPlaceholder()
+        store.updateAssistantContent(placeholder.id, "на связи")
+        store.finalizeAssistant(placeholder.id)
+
+        val added = store.mergeServerMessages(listOf(serverMessage(14, text = "на связи")))
+
+        assertEquals(0, added)
+        assertEquals(14L, store.messages.single().serverId)
+    }
+
+    @Test
+    fun `подтверждение приёма ставит серверный id, не двигая курсор`() {
+        val store = ChatStore()
+        val local = store.appendUserMessage("да")
+        store.setFailed(local.id, true)
+
+        store.confirmUserMessage(local.id, 60L)
+
+        assertEquals(60L, store.messages.single().serverId)
+        // Строки между прежним курсором и этой принесёт догон — курсор их пропускать не вправе.
+        assertEquals(0L, store.lastServerMessageId)
+        assertTrue(store.messages.single().failed)
+        assertTrue(store.isIdConfirmed(local.id))
+    }
+
+    /** Догон успел влить серверную копию раньше `meta`: дубля в ленте быть не должно. */
+    @Test
+    fun `подтверждение убирает серверную копию той же строки`() {
+        val store = ChatStore()
+        val local = store.appendUserMessage("да")
+        store.mergeServerMessages(listOf(serverMessage(61, role = "user", text = "да, другое эхо")))
+
+        store.confirmUserMessage(local.id, 61L)
+
+        assertEquals(1, store.messages.size)
+        assertEquals(local.id, store.messages.single().id)
+    }
+
+    @Test
+    fun `ответ после подтверждённой строки снимает пометку и Повторить`() {
+        val store = ChatStore()
+        val local = store.appendUserMessage("да")
+        store.confirmUserMessage(local.id, 70L)
+        store.setFailed(local.id, true)
+        store.setRetryable("да")
+
+        store.mergeServerMessages(listOf(serverMessage(71, text = "готово")))
+
+        assertFalse(store.messages.first { it.id == local.id }.failed)
+        assertNull(store.state.value.retryable)
+    }
+
+    @Test
+    fun `подтверждённая строка без ответа пометку сохраняет`() {
+        val store = ChatStore()
+        val local = store.appendUserMessage("да")
+        store.confirmUserMessage(local.id, 70L)
+        store.setFailed(local.id, true)
+        store.setRetryable("да")
+
+        store.mergeServerMessages(listOf(serverMessage(70, role = "user", text = "да")))
+
+        assertTrue(store.messages.first { it.id == local.id }.failed)
+        assertEquals("да", store.state.value.retryable)
+    }
+
+    /** Диалог ведёт человек: ответ придёт от него, и повтор ничего не ускорит. */
+    @Test
+    fun `в режиме менеджера подтверждённая строка доставлена`() {
+        val store = ChatStore()
+        val local = store.appendUserMessage("позови человека")
+        store.confirmUserMessage(local.id, 80L)
+        store.setFailed(local.id, true)
+        store.setMode(ChatMode.Human)
+
+        assertTrue(store.isSettled(local.id))
+        store.mergeServerMessages(emptyList())
+        assertFalse(store.messages.single().failed)
+    }
+
+    // ─── Другое устройство ────────────────────────────────────────────────────────────────
+
+    @Test
+    fun `смена устройства уносит серверные строки и курсор, оставляя неотправленные`() {
+        val store = ChatStore()
+        store.markClientIdsSupported()
+        store.mergeServerMessages(listOf(serverMessage(90, text = "прежний тред")))
+        val failed = store.appendUserMessage("не ушло")
+        store.setFailed(failed.id, true)
+        store.setRetryable("не ушло")
+        val confirmed = store.appendUserMessage("ушло")
+        store.confirmUserMessage(confirmed.id, 91L)
+
+        store.resetForDeviceChange()
+
+        assertEquals(listOf(failed.id), store.messages.map { it.id })
+        assertEquals(0L, store.lastServerMessageId)
+        assertEquals("не ушло", store.state.value.retryable)
+        assertFalse(store.isIdConfirmed(confirmed.id))
+    }
+
     @Test
     fun `выход сбрасывает курсор`() {
         val store = ChatStore()

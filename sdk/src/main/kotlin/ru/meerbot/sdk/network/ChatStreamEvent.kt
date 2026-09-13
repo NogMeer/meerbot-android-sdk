@@ -23,7 +23,25 @@ import ru.meerbot.sdk.state.ChatMode
  * Незнакомое событие — не ошибка: сервер расширяем без ломки клиентов.
  */
 sealed class ChatStreamEvent {
-    data class Meta(val conversationId: Long, val mode: ChatMode) : ChatStreamEvent()
+    data class Meta(val conversationId: Long, val mode: ChatMode) : ChatStreamEvent() {
+        /**
+         * Подтверждение приёма отправки: `clientMessageId` запроса, серверный id строки
+         * пользователя и признак повтора (сообщение с этим id уже было сохранено раньше).
+         *
+         * Поля в ТЕЛЕ класса, а не в конструкторе: `equals`/`copy`/`componentN` data-класса их
+         * не видят, и приложение, собранное против 0.2.8, не получает `NoSuchMethodError` на
+         * обновлении. Сервер без поддержки `clientMessageId` их не присылает — тогда здесь
+         * `null`/`false`, и SDK работает по прежним правилам (сверка эха по тексту).
+         */
+        var clientMessageId: String? = null
+            internal set
+
+        var userMessageId: Long? = null
+            internal set
+
+        var replayed: Boolean = false
+            internal set
+    }
     data class ContentDelta(val text: String) : ChatStreamEvent()
     object Done : ChatStreamEvent()
     data class Manager(val message: ManagerMessage) : ChatStreamEvent()
@@ -59,7 +77,19 @@ sealed class ChatStreamEvent {
                 "meta" -> Meta(
                     conversationId = json?.optLong("conversationId", -1L) ?: -1L,
                     mode = ChatMode.from(json?.optString("mode")),
-                )
+                ).apply {
+                    // Подтверждение приёма — только целиком: id без серверного номера строки
+                    // (или наоборот) ничего не подтверждает и трактуется как старый сервер.
+                    if (json != null) {
+                        val clientId = json.optStringOrNull("clientMessageId")
+                        val userId = if (json.isNull("userMessageId")) 0L else json.optLong("userMessageId", 0L)
+                        if (clientId != null && userId > 0L) {
+                            clientMessageId = clientId.lowercase()
+                            userMessageId = userId
+                            replayed = json.optBoolean("replayed", false)
+                        }
+                    }
+                }
 
                 "manager_message" -> {
                     val text = json?.optString("text").orEmpty()
