@@ -1,6 +1,8 @@
 package ru.meerbot.sdk.testing
 
 import android.content.SharedPreferences
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /**
  * `SharedPreferences` в памяти: в JVM-тестах настоящих нет, а Robolectric в проекте не
@@ -23,6 +25,16 @@ class FakeSharedPreferences : SharedPreferences {
 
     @Volatile
     var applies = 0
+
+    /**
+     * Медленный `commit()`: входя, он отпускает [commitEntered] и ждёт [commitGate], и только
+     * потом пишет. Так воспроизводится окно «синхронная запись ещё идёт» без `Thread.sleep`.
+     */
+    @Volatile
+    var commitEntered: CountDownLatch? = null
+
+    @Volatile
+    var commitGate: CountDownLatch? = null
 
     private fun <T> read(block: () -> T): T {
         if (failReads) throw SecurityException("Could not decrypt value")
@@ -67,6 +79,8 @@ class FakeSharedPreferences : SharedPreferences {
 
         override fun commit(): Boolean {
             commits++
+            commitEntered?.countDown()
+            commitGate?.await(10, TimeUnit.SECONDS)
             return write()
         }
 

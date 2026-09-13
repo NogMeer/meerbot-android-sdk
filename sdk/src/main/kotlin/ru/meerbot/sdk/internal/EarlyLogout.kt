@@ -25,6 +25,10 @@ import java.util.concurrent.atomic.AtomicInteger
  * Хост, отключивший инициализатор (`tools:node="remove"` на `InitializationProvider` или на
  * этой записи `meta-data`), теряет одно: выход до `configure` живёт только в памяти процесса,
  * а в лог уходит `logout_not_persisted`. После `configure` контекст у SDK есть в любом случае.
+ *
+ * Только основной процесс: провайдер без `android:process` создаётся лишь в нём. В другом
+ * процессе приложения (`:remote`) инициализатор не запускается, и выход до первого `configure`
+ * в этом процессе тоже живёт только в памяти (`logout_not_persisted`).
  */
 internal class MeerBotInitializer : Initializer<Unit> {
     override fun create(context: Context) {
@@ -57,18 +61,23 @@ internal object EarlyLogout {
 }
 
 /**
- * Запись «пользователь вышел, а SDK ещё не настроен». Содержимое — случайный маркер отметки.
+ * Отметки «пользователь вышел, а SDK ещё не настроен»: по файлу на отметку,
+ * `meerbot_sdk_logout.<маркер>`, где маркер — случайный UUID. Выход ждёт применения, пока есть
+ * хоть одна отметка.
  *
- * Почему файл, а не prefs:
+ * Почему файлы, а не prefs:
  * - **Чтение всегда с диска.** `SharedPreferences` кэшируют файл в памяти процесса: второй
- *   процесс приложения (свой `:remote`-сервис, где тоже зовут `configure`) видел бы флаг, уже
- *   снятый первым, и повторил бы выход поверх пользователя, успевшего войти.
+ *   процесс приложения, где SDK настраивается, видел бы флаг, уже снятый первым, и повторил бы
+ *   выход поверх пользователя, успевшего войти.
  * - **`noBackupFilesDir`.** Каталог не попадает в Auto Backup и перенос на новое устройство:
  *   восстановленная копия не принесёт давно применённый выход на свежую установку.
  * - Отдельно от prefs SDK: `meerbot_sdk` служит запасным хранилищем при недоступном Keystore.
  *
- * Маркер нужен, чтобы снять ровно ту отметку, что применили: отметка, записанная в полёте
- * (другим вызовом или другим процессом), остаётся и применяется своим чередом.
+ * Почему файл на отметку: запись и снятие не пересекаются между процессами. Отметка пишется
+ * во временный файл со своим маркером в имени и переименовывается; снятие удаляет ровно свой
+ * файл, ничего не читая. С одним общим файлом два процесса затирали бы общий временный файл
+ * друг друга, а снятие «прочитать и удалить, если маркер мой» могло удалить отметку соседа,
+ * записанную между чтением и удалением.
  *
  * С установкой отметка не связывается сознательно: до `configure` идентификатор установки
  * лежит в зашифрованных prefs, и прочитать его значило бы открывать Keystore на пути
@@ -78,6 +87,8 @@ internal object EarlyLogout {
  * Пределы при нескольких процессах: чтение, применение и снятие не атомарны между процессами.
  * Два процесса, настраивающие SDK одновременно, могут применить одну отметку оба (второй выход
  * безвреден, пока в этом окне никто не вошёл). Чат SDK рассчитан на один процесс приложения.
+ * В процессе, где не отработал инициализатор (`:remote`), отметку до `configure` записать
+ * некуда — см. [MeerBotInitializer].
  */
 internal class EarlyLogoutFile(
     private val directory: () -> File?,
@@ -111,54 +122,67 @@ internal class EarlyLogoutFile(
     /** `false` — после отметки был [clearAll] (`reset()`), и её на диске уже нет. */
     fun isIntact(mark: Mark): Boolean = mark.resetEpoch == resets.get()
 
-    /** Маркер отметки на диске или `null`. Читается файл, а не кэш. */
-    fun read(): String? {
-        val file = File(directory() ?: return null, FILE_NAME)
-        return try {
-            if (!file.exists()) null else file.readText().trim().ifEmpty { null }
-        } catch (e: IOException) {
-            onError.report("early_logout_read_failed", e)
-            null
+    /** Маркеры всех отметок на диске, по возрастанию. Читается каталог, а не кэш. */
+    fun read(): List<String> {
+        val dir = directory() ?: return emptyList()
+        if (!dir.isDirectory) return emptyList()
+        val names = dir.list() ?: run {
+            onError.report("early_logout_read_failed", IOException("list() returned null: $dir"))
+            return emptyList()
         }
+        return names.mapNotNull(::markerOf).sorted()
     }
 
-    /** Снять отметку, только если на диске всё ещё [marker]. */
+    /** Снять отметку [marker] — удалить ровно её файл. Чужие отметки не трогаются. */
     fun clear(marker: String) {
-        synchronized(lock) {
-            if (read() == marker) delete()
-        }
+        if (!isMarker(marker)) return
+        val dir = directory() ?: return
+        delete(File(dir, PREFIX + marker))
     }
 
-    /** Снять любую отметку (`reset()`): отметки, выданные раньше, больше не действуют. */
+    /** Снять все отметки (`reset()`): отметки, выданные раньше, больше не действуют. */
     fun clearAll() {
         synchronized(lock) {
             resets.incrementAndGet()
-            delete()
+            val dir = directory() ?: return
+            // Вместе с отметками — временные файлы записей, оборванных убийством процесса.
+            dir.listFiles { file -> file.name.startsWith(PREFIX) }?.forEach(::delete)
         }
     }
 
-    private fun delete() {
-        val file = File(directory() ?: return, FILE_NAME)
-        if (file.exists() && !file.delete()) {
-            onError.report("early_logout_clear_failed", IOException("delete() returned false"))
+    private fun delete(file: File) {
+        if (file.exists() && !file.delete() && file.exists()) {
+            onError.report("early_logout_clear_failed", IOException("delete() returned false: ${file.name}"))
         }
     }
 
-    /** Временный файл + `fsync` + переименование: оборванная запись не оставит пустую отметку. */
+    /**
+     * Временный файл со своим маркером + `fsync` + переименование: оборванная запись не
+     * оставит отметку, а параллельная запись другого процесса — свой временный файл.
+     */
     private fun writeAtomically(dir: File, marker: String) {
         if (!dir.isDirectory && !dir.mkdirs()) throw IOException("no directory: $dir")
-        val tmp = File(dir, "$FILE_NAME.tmp")
+        val tmp = File(dir, PREFIX + marker + TMP_SUFFIX)
         FileOutputStream(tmp).use { out ->
             out.write(marker.toByteArray(Charsets.UTF_8))
             out.fd.sync()
         }
-        if (!tmp.renameTo(File(dir, FILE_NAME))) {
+        if (!tmp.renameTo(File(dir, PREFIX + marker))) {
             tmp.delete()
             throw IOException("rename failed")
         }
     }
 
+    /** Маркер из имени файла отметки; временные и посторонние файлы — `null`. */
+    private fun markerOf(name: String): String? =
+        name.takeIf { it.startsWith(PREFIX) }?.removePrefix(PREFIX)?.takeIf(::isMarker)
+
+    /** Только канонический UUID: маркер попадает в имя файла, путь из него не собрать. */
+    private fun isMarker(value: String): Boolean =
+        runCatching { UUID.fromString(value).toString() == value }.getOrDefault(false)
+
     private companion object {
-        const val FILE_NAME = "meerbot_sdk_logout"
+        const val PREFIX = "meerbot_sdk_logout."
+        const val TMP_SUFFIX = ".tmp"
     }
 }

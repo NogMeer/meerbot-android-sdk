@@ -18,6 +18,11 @@ class ChatStoreMergeTest {
     /** Строка «вчерашней» истории — заведомо старше всего, что появилось на устройстве. */
     private val yesterday = System.currentTimeMillis() - 24 * 60 * 60 * 1000L
 
+    private companion object {
+        /** Больше допуска сверки эха по времени (5 минут). */
+        const val SIX_MINUTES = 6 * 60 * 1000L
+    }
+
     private fun serverMessage(
         id: Long,
         role: String = "assistant",
@@ -258,6 +263,46 @@ class ChatStoreMergeTest {
 
         store.mergeServerMessages(listOf(serverMessage(8, role = "user", text = "да")))
         assertEquals(8L, store.messages.single { it.id == local.id }.serverId)
+    }
+
+    /**
+     * Часы устройства спешат больше допуска, тред пуст. Стартовая история (пустая) уже пришла:
+     * любая серверная строка новее отправки, время не сравнивается. До правки порог 0 означал
+     * сверку по времени — первое сообщение и первый ответ ИИ двоились.
+     */
+    @Test
+    fun `пустой тред и спешащие часы устройства — эхо сообщения и ответа узнаётся`() {
+        val store = ChatStore()
+        store.mergeServerMessages(emptyList())
+        val local = store.appendUserMessage("привет")
+        val placeholder = store.appendAssistantPlaceholder()
+        store.updateAssistantContent(placeholder.id, "Здравствуйте")
+        store.finalizeAssistant(placeholder.id)
+        val serverNow = System.currentTimeMillis() - SIX_MINUTES
+
+        val added = store.mergeServerMessages(
+            listOf(
+                serverMessage(1, role = "user", text = "привет", at = serverNow),
+                serverMessage(2, text = "Здравствуйте", at = serverNow),
+            ),
+        )
+
+        assertEquals(0, added)
+        assertEquals(listOf(local.id, placeholder.id), store.messages.map { it.id })
+        assertEquals(listOf(1L, 2L), store.messages.map { it.serverId })
+    }
+
+    /** Курсор прежнего пользователя «известен», у нового — нет: вчерашняя строка не эхо. */
+    @Test
+    fun `после сброса identity курсор снова неизвестен`() {
+        val store = ChatStore()
+        store.mergeServerMessages(emptyList())
+        store.resetForIdentityChange()
+        val local = store.appendUserMessage("да")
+
+        store.mergeServerMessages(listOf(serverMessage(5, role = "user", text = "да", at = yesterday)))
+
+        assertNull(store.messages.single { it.id == local.id }.serverId)
     }
 
     @Test

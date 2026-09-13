@@ -100,7 +100,8 @@ class ChatStore {
     fun setRetryable(text: String?) = _state.update { it.copy(retryable = text) }
 
     /**
-     * Курсор ленты на момент появления локальной строки: id → `lastServerMessageId` тогда.
+     * Курсор ленты на момент появления локальной строки: id → `lastServerMessageId` тогда. Записи
+     * нет — лента с сервером на тот момент ещё не сверялась, курсор неизвестен.
      *
      * Эхом строки может быть только серверная строка НОВЕЕ этого курсора: всё, что не новее,
      * сервер записал до отправки. Без этого вчерашнее «да» из стартовой истории, пришедшей
@@ -110,6 +111,20 @@ class ChatStore {
      * Потокобезопасна: в тестах слияние идёт не с главного потока.
      */
     private val echoFloors = ConcurrentHashMap<String, Long>()
+
+    /**
+     * Лента хотя бы раз сверена с сервером после последнего сброса: курсор ИЗВЕСТЕН, даже
+     * если он 0 (тред пуст). Отличает «тред был пуст при отправке» — тогда любая серверная
+     * строка новее отправки, и время сравнивать не нужно — от «история ещё не пришла».
+     * Раньше оба случая давали порог 0 и сверку по времени: часы устройства, спешащие больше
+     * допуска, делали эхо первого сообщения неузнаваемым — оно и ответ двоились, а обрыв
+     * отправки оставлял «Повторить» на доставленном (второй платный ответ модели).
+     *
+     * Ставится ПОСЛЕ записи курсора: отправка, прочитавшая флаг раньше, получит «неизвестен» и
+     * сверку по времени, а не порог 0 при ещё не записанной странице.
+     */
+    @Volatile
+    private var cursorKnown = false
 
     fun appendUserMessage(content: String): ChatMessage {
         val msg = ChatMessage(role = "user", content = content)
@@ -132,7 +147,7 @@ class ChatStore {
     internal fun markResent(id: String) = rememberEchoFloor(id)
 
     private fun rememberEchoFloor(id: String) {
-        echoFloors[id] = _state.value.lastServerMessageId
+        if (cursorKnown) echoFloors[id] = _state.value.lastServerMessageId else echoFloors.remove(id)
     }
 
     /**
@@ -200,8 +215,11 @@ class ChatStore {
      * не зовёт: история вливается через [mergeServerMessages], иначе ответ истории, пришедший
      * после отправки, убирал бы отправленное сообщение с экрана.
      */
-    fun replaceAll(items: List<ChatMessage>) = _state.update {
-        it.copy(messages = items, lastServerMessageId = bumpCursor(it.lastServerMessageId, items))
+    fun replaceAll(items: List<ChatMessage>) {
+        _state.update {
+            it.copy(messages = items, lastServerMessageId = bumpCursor(it.lastServerMessageId, items))
+        }
+        cursorKnown = true
     }
 
     /**
@@ -272,6 +290,7 @@ class ChatStore {
                 lastServerMessageId = bumpCursor(current.lastServerMessageId, items),
             )
         }
+        cursorKnown = true
         return added
     }
 
@@ -293,14 +312,15 @@ class ChatStore {
      * Может ли серверная строка быть эхом локальной. Старая строка с тем же текстом эхом не
      * бывает никогда. Паритет с iOS.
      *
-     * Курсор на момент появления известен (> 0) — эхо только новее него по серверному id. Не
-     * известен (история ещё не пришла, либо тред пуст) — сравниваем время: серверный
-     * `createdAt` не раньше локального минус [ECHO_CLOCK_TOLERANCE_MS] (часы устройства могут
-     * спешить).
+     * Курсор на момент появления известен (лента сверялась с сервером, в том числе пустой
+     * страницей — тогда он 0) — эхо только новее него по серверному id, время не сравнивается.
+     * Не известен (история ещё не пришла) — сравниваем время: серверный `createdAt` не раньше
+     * локального минус [ECHO_CLOCK_TOLERANCE_MS] (часы устройства могут спешить; спешащие
+     * больше допуска в этом окне эхо не узнают).
      */
     private fun canBeEcho(local: ChatMessage, item: ChatMessage): Boolean {
-        val floor = echoFloors[local.id] ?: 0L
-        return if (floor > 0L) {
+        val floor = echoFloors[local.id]
+        return if (floor != null) {
             (item.serverId ?: return false) > floor
         } else {
             item.timestamp >= local.timestamp - ECHO_CLOCK_TOLERANCE_MS
@@ -312,8 +332,10 @@ class ChatStore {
      * отправки известен — новее него, иначе — любая. Для сверки после обрыва: ответ, записанный
      * до отправки, доставкой не считается.
      */
-    internal fun isAfterSend(localId: String, serverId: Long): Boolean =
-        serverId > (echoFloors[localId] ?: 0L)
+    internal fun isAfterSend(localId: String, serverId: Long): Boolean {
+        val floor = echoFloors[localId]
+        return floor == null || serverId > floor
+    }
 
     /**
      * Место новой серверной строки — сразу после последней строки ленты, которая раньше неё.
@@ -338,6 +360,7 @@ class ChatStore {
         maxOf(current, items.mapNotNull { it.serverId }.maxOrNull() ?: 0L)
 
     fun resetForLogout() {
+        cursorKnown = false
         _state.value = ChatState()
         echoFloors.clear()
     }
@@ -347,6 +370,7 @@ class ChatStore {
      * Приветствие — настройка хоста, а не переписка, поэтому остаётся.
      */
     internal fun resetForIdentityChange() {
+        cursorKnown = false
         _state.update { ChatState(greeting = it.greeting) }
         echoFloors.clear()
     }

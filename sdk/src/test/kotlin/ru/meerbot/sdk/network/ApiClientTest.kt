@@ -20,8 +20,11 @@ import org.junit.Before
 import org.junit.Test
 import ru.meerbot.sdk.R
 import ru.meerbot.sdk.state.ChatMode
+import ru.meerbot.sdk.testing.FakeSharedPreferences
 import ru.meerbot.sdk.testing.ScriptedDispatcher
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 
 /**
  * Сетевой слой канала `mobile_app` против MockWebServer.
@@ -405,6 +408,91 @@ class ApiClientTest {
         }
 
         assertTrue(flag.pending)
+    }
+
+    /**
+     * `identify(null)` с фонового потока: `commit()` ещё идёт, а рукопожатие уже унесло
+     * `logout` вместе с токеном уходящего пользователя и получило `unlinked`. Сервер привязал
+     * устройство к нему обратно, поэтому ни этот ответ, ни ответ рукопожатия, начатого ПОСЛЕ
+     * записи, но до применения выхода, флаг снимать не вправе: убитый до применения процесс
+     * забыл бы выход. Флаг на диске проверяется новым хранилищем — как после перезапуска.
+     */
+    @Test
+    fun `выход, записанный на диск, но не применённый, рукопожатие не снимает`() = runBlocking {
+        val prefs = FakeSharedPreferences()
+        val api = client(PrefsLogoutFlagStore(prefs))
+        api.setIdentityToken("signed-A")
+        server.enqueue(registerResponse(jwt = "jwt-A", unlinked = true))
+        api.openSession()
+        assertEquals(false, prefs.values[PrefsLogoutFlagStore.KEY])
+        api.invalidateToken()
+
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        prefs.commitEntered = entered
+        prefs.commitGate = release
+        val writer = thread { api.persistLogoutIntent() }
+        assertTrue(entered.await(5, TimeUnit.SECONDS))
+
+        server.enqueue(registerResponse(jwt = "jwt-during-write", unlinked = true))
+        api.openSession()
+        release.countDown()
+        writer.join(5_000)
+        prefs.commitGate = null
+
+        api.invalidateToken()
+        server.enqueue(registerResponse(jwt = "jwt-after-write", unlinked = true))
+        api.openSession()
+
+        server.takeRequest()
+        repeat(2) {
+            val body = registerBody()
+            assertTrue(body.getBoolean("logout"))
+            assertEquals("signed-A", body.getString("identityToken"))
+        }
+        assertEquals(true, prefs.values[PrefsLogoutFlagStore.KEY])
+        assertTrue(PrefsLogoutFlagStore(prefs).pending)
+
+        // Выход применён: следующее рукопожатие несёт его без токена, и подтверждение снимает флаг.
+        api.logout()
+        server.enqueue(registerResponse(jwt = "jwt-anon", unlinked = true))
+        api.openSession()
+
+        val body = registerBody()
+        assertTrue(body.getBoolean("logout"))
+        assertFalse(body.has("identityToken"))
+        assertEquals(false, prefs.values[PrefsLogoutFlagStore.KEY])
+    }
+
+    /**
+     * Повторный `configure`: прежний клиент и новый пишут флаг выхода в одни prefs, но счётчики и
+     * кэш значения у каждого свои. Ответ, пришедший прежнему, не должен стирать флаг на диске,
+     * который новый держит в памяти, — иначе убитый процесс забудет выход.
+     */
+    @Test
+    fun `ответ заменённому клиенту не снимает общий флаг выхода`() = runBlocking {
+        val prefs = FakeSharedPreferences()
+        val dispatcher = gated()
+        val gate = dispatcher.gateNextRegister(registerResponse(jwt = "jwt-old", unlinked = true))
+        dispatcher.registerFallback = { registerResponse(jwt = "jwt-old-retry", unlinked = true) }
+        val old = client(PrefsLogoutFlagStore(prefs))
+        old.setIdentityToken("signed-A")
+
+        withContext(Dispatchers.Default) {
+            val pending = async { runCatching { old.openSession() } }
+            assertTrue(JSONObject(dispatcher.awaitRegister().body.readUtf8()).getBoolean("logout"))
+
+            old.retire()
+            val fresh = client(PrefsLogoutFlagStore(prefs))
+            fresh.persistLogoutIntent()
+            fresh.logout()
+
+            gate.countDown()
+            pending.await()
+        }
+
+        assertEquals(true, prefs.values[PrefsLogoutFlagStore.KEY])
+        assertTrue(PrefsLogoutFlagStore(prefs).pending)
     }
 
     @Test

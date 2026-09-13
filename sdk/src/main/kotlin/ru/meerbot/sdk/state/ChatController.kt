@@ -305,8 +305,14 @@ class ChatController(
         val sentInEpoch = identityEpoch.get()
 
         streamJob = scope.launch {
+            // Сервер закончил ответ сам (`[DONE]`, ошибка, таймаут, рестарт) или поток дочитан —
+            // отличает завершённую отправку от оборванной отменой.
+            var serverFinished = false
             try {
-                client.sendMessage(text).collect { handle(it, userMessageId, placeholderId) }
+                client.sendMessage(text).collect {
+                    if (handle(it, userMessageId, placeholderId)) serverFinished = true
+                }
+                serverFinished = true
                 store.finalizeAssistant(placeholderId)
                 store.dropEmptyPlaceholder(placeholderId)
                 store.setSending(false)
@@ -315,10 +321,15 @@ class ChatController(
                 // обе строки как «новые», и слияние держалось бы на совпадении текста.
                 catchUp(silent = true)
             } catch (e: CancellationException) {
-                // Отмена приходит либо от новой отправки, либо от stop(): свой плейсхолдер
-                // подчищаем, но общий флаг отправки не трогаем — им уже владеет новая задача.
-                store.finalizeAssistant(placeholderId)
-                store.dropEmptyPlaceholder(placeholderId)
+                // Отмена приходит от stop() (экран закрыт, приложение ушло в фон), от новой
+                // отправки или от смены пользователя. Общий флаг отправки не трогаем — им уже
+                // владеет stop() или новая задача.
+                if (serverFinished || identityEpoch.get() != sentInEpoch) {
+                    store.finalizeAssistant(placeholderId)
+                    store.dropEmptyPlaceholder(placeholderId)
+                } else {
+                    settleCancelledSend(text, userMessageId, placeholderId)
+                }
                 throw e
             } catch (e: Throwable) {
                 handleFailure(e, text, userMessageId, placeholderId, sentInEpoch)
@@ -326,7 +337,8 @@ class ChatController(
         }
     }
 
-    private fun handle(event: ChatStreamEvent, userMessageId: String, placeholderId: String) {
+    /** @return `true` — событие завершает ответ со стороны сервера. */
+    private fun handle(event: ChatStreamEvent, userMessageId: String, placeholderId: String): Boolean {
         when (event) {
             is ChatStreamEvent.Meta -> store.setMode(event.mode)
 
@@ -337,6 +349,7 @@ class ChatController(
                 store.finalizeAssistant(placeholderId)
                 store.dropEmptyPlaceholder(placeholderId)
                 store.setSending(false)
+                return true
             }
 
             is ChatStreamEvent.Manager -> {
@@ -356,11 +369,13 @@ class ChatController(
                 store.dropEmptyPlaceholder(placeholderId)
                 store.setSending(false)
                 store.setError(chatError(MeerBotError.Stream(event.code, event.message)))
+                return true
             }
 
             is ChatStreamEvent.Timeout -> {
                 store.finalizeAssistant(placeholderId)
                 store.setSending(false)
+                return true
             }
 
             is ChatStreamEvent.Shutdown -> {
@@ -374,10 +389,37 @@ class ChatController(
                     runCatching { loadHistory() }
                     settleInterruptedReply(userMessageId, placeholderId)
                 }
+                return true
             }
 
             is ChatStreamEvent.Unknown -> Unit
         }
+        return false
+    }
+
+    /**
+     * Отправку отменили изнутри приложения — `stop()` (экран закрыт, приложение ушло в фон) или
+     * новая отправка — до того, как сервер закончил ответ. Паритет с iOS `settleCancelledSend`.
+     *
+     * Сообщение без серверного эха — НЕДОСТАВЛЕННОЕ: дошёл ли запрос, не знает никто, а молча
+     * пропасть оно не имеет права. Раньше отмена только убирала пустой пузырь, и сообщение,
+     * чья регистрация ещё шла, оставалось в ленте без пометки и без «Повторить». Если запрос всё
+     * же дошёл, догон при следующем показе экрана узнает эхо, снимет пометку и «Повторить».
+     * Эхо уже известно — сообщение доставлено, повтор отправил бы его второй раз. Баннер не
+     * ставится: ошибки связи не было.
+     *
+     * Недописанный пузырь убирается: сервер на обрыв соединения прерывает генерацию, и обрывок
+     * окончательной версией не станет — что сервер сохранил, принесёт догон. Сообщения нет в
+     * ленте (её сбросил `reset()`) — повторять нечего.
+     */
+    private fun settleCancelledSend(text: String, userMessageId: String, placeholderId: String) {
+        if (store.messages.firstOrNull { it.id == placeholderId }?.serverId == null) {
+            store.removeMessage(placeholderId)
+        }
+        val message = store.messages.firstOrNull { it.id == userMessageId } ?: return
+        if (message.serverId != null) return
+        store.setFailed(userMessageId, true)
+        store.setRetryable(text)
     }
 
     /**

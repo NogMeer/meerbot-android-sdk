@@ -1,16 +1,20 @@
 package ru.meerbot.sdk.network
 
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.FlowCollector
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import okhttp3.Call
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -23,6 +27,7 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** Ответ рукопожатия `/api/v1/mobile/register`. */
 data class MobileSession(
@@ -116,11 +121,17 @@ class ApiClient internal constructor(
     private var tokenRevision = 0
 
     /**
-     * Ревизия записанного выхода ([persistLogoutIntent]). Рукопожатие снимает флаг, только если
-     * за время запроса выход не записали снова: иначе ответ на прежний выход стёр бы новый,
-     * записанный на диск до того, как главный поток его применил.
+     * Выходы, записанные на диск ([persistLogoutIntent]), но ещё не применённые ([logout]).
+     * Пока такой есть, рукопожатие флаг не снимает. Ревизии «до и после записи» здесь мало:
+     * рукопожатие, начатое ПОСЛЕ записи, но до применения, несёт `logout` вместе с токеном
+     * уходящего пользователя, и сервер привязывает устройство к нему обратно. Сними ответ флаг —
+     * процесс, убитый до применения выхода, забыл бы его, и следующий человек открыл бы тред
+     * прежнего. Пишется и читается только под [sessionLock].
      */
-    private var logoutIntent = 0
+    private var unappliedLogouts = 0
+
+    /** Клиент заменён повторным `configure` или `reset()` и общий флаг выхода не трогает. */
+    private var retired = false
 
     @Volatile
     private var jwt: String? = null
@@ -221,9 +232,30 @@ class ApiClient internal constructor(
      * Флаг снимается только ответом, в котором сервер сообщил `unlinked`: старый сервер поле
      * `logout` игнорирует, и сигнал уходит снова на каждом рукопожатии, пока сервер не обновят.
      * Для устройства без связи повтор ничего не меняет.
+     *
+     * Применяет один выход, записанный [persistLogoutIntent]: с этого момента рукопожатие несёт
+     * `logout` уже без токена уходящего пользователя, и его подтверждение флаг снимает.
      */
     internal fun logout() {
-        beginNewIdentity(token = null)
+        synchronized(sessionLock) {
+            beginNewIdentity(token = null)
+            if (unappliedLogouts > 0) unappliedLogouts--
+        }
+    }
+
+    /**
+     * Клиент заменён (повторный `configure`, `reset()`). Ответ, пришедший ему после этого, флаг
+     * выхода не снимает: хранилище флага общее с новым клиентом, а сессия и счётчики — нет.
+     * Иначе ответ старому стёр бы флаг на диске, пока новый держит его только в памяти, и
+     * убитый процесс забыл бы выход. Поколение растёт — рукопожатие в полёте своей сессии не
+     * сохранит.
+     */
+    internal fun retire() {
+        synchronized(sessionLock) {
+            retired = true
+            generation++
+            invalidateToken()
+        }
     }
 
     /**
@@ -242,9 +274,13 @@ class ApiClient internal constructor(
      * ложится на диск позже, и процесс, убитый в этом окне, забыл бы выход: следующий человек
      * открыл бы тред прежнего. Запись редкая — раз на выход. Сбой хранилища пишется в лог
      * (`logout_flag_write_failed`), флаг остаётся в памяти процесса.
+     *
+     * Каждый вызов обязан завершиться [logout] (так делает `MeerBot`): до него рукопожатие флаг
+     * не снимает (см. [unappliedLogouts]). Счётчик растёт ДО записи — рукопожатие, прочитавшее
+     * флаг посреди `commit()`, тоже его не снимет.
      */
     internal fun persistLogoutIntent() {
-        synchronized(sessionLock) { logoutIntent++ }
+        synchronized(sessionLock) { unappliedLogouts++ }
         logoutFlag.persistPending()
     }
 
@@ -252,7 +288,8 @@ class ApiClient internal constructor(
      * Флаг, поколение и клиентское состояние прежнего человека меняются под одним замком: иначе
      * рукопожатие, закончившееся между записью флага и сменой поколения, сняло бы только что
      * поставленный флаг (его запрос ушёл без `logout`). Запись флага — `apply()` на
-     * in-memory prefs, диск пишется позже и замок не держит.
+     * in-memory prefs, диск пишется позже и замок не держит. Для выхода это не окно потери: он
+     * уже на диске ([persistLogoutIntent]), и до этого места снять его рукопожатие не могло.
      */
     private fun beginNewIdentity(token: String?) {
         synchronized(sessionLock) {
@@ -278,13 +315,11 @@ class ApiClient internal constructor(
         repeat(MAX_REGISTER_ATTEMPTS) {
             val startedIn: Int
             val startedRevision: Int
-            val startedIntent: Int
             val token: String?
             val logoutSent: Boolean
             synchronized(sessionLock) {
                 startedIn = generation
                 startedRevision = tokenRevision
-                startedIntent = logoutIntent
                 token = identityToken
                 logoutSent = logoutFlag.pending
             }
@@ -308,7 +343,7 @@ class ApiClient internal constructor(
             // провал запроса, которого он не делал, вместо повтора с его токеном.
             if (synchronized(sessionLock) { generation != startedIn }) return@repeat
 
-            val session = parseSession(raw, logoutSent, startedIn, startedRevision, startedIntent)
+            val session = parseSession(raw, logoutSent, startedIn, startedRevision)
                 ?: return@repeat
             return session
         }
@@ -326,7 +361,6 @@ class ApiClient internal constructor(
         logoutSent: Boolean,
         startedIn: Int,
         startedRevision: Int,
-        startedIntent: Int,
     ): MobileSession? {
         val json = parseJson(raw)
         val jwtValue = json.optStringOrNull("jwt") ?: throw MeerBotError.InvalidResponse
@@ -353,7 +387,7 @@ class ApiClient internal constructor(
                 jwtExpiresAtMs = System.currentTimeMillis() + expiresIn * 1000L
                 identityStatus = status
             }
-            if (logoutSent && unlinkedConfirmed && logoutIntent == startedIntent) logoutFlag.pending = false
+            if (logoutSent && unlinkedConfirmed && unappliedLogouts == 0 && !retired) logoutFlag.pending = false
             true
         }
         if (!committed) return null
@@ -475,10 +509,7 @@ class ApiClient internal constructor(
             .build()
             .newCall(request)
 
-        // Отмена корутины должна рвать сокет: readUtf8Line() блокирующий и сам её не заметит.
-        val cancelHandle = currentCoroutineContext()[Job]?.invokeOnCompletion { call.cancel() }
-
-        try {
+        cancelCallOnCancellation(call) {
             val response = try {
                 call.execute()
             } catch (e: IOException) {
@@ -492,7 +523,7 @@ class ApiClient internal constructor(
                     if (allowRetry && error.isExpiredToken) {
                         invalidateToken()
                         runStream(text, allowRetry = false, collector = collector, startedIn = startedIn)
-                        return
+                        return@use
                     }
                     throw error
                 }
@@ -508,8 +539,30 @@ class ApiClient internal constructor(
                     throw MeerBotError.Network(e.message ?: "stream_broken")
                 }
             }
+        }
+    }
+
+    /**
+     * Отмена корутины рвёт сокет [call]: `execute()` и `readUtf8Line()` блокирующие и сами её не
+     * заметят. Раньше здесь стоял `Job.invokeOnCompletion { call.cancel() }` — он срабатывает на
+     * ЗАВЕРШЕНИИ задачи, а задача, висящая в блокирующем чтении, не завершится, пока сервер не
+     * пришлёт байт: закрытый экран держал запрос (и генерацию ответа) до следующего кадра.
+     * Сторож — дочерняя корутина: отмена родителя отменяет её сразу, и она закрывает вызов.
+     */
+    private suspend fun cancelCallOnCancellation(call: Call, block: suspend () -> Unit) = coroutineScope {
+        val finished = AtomicBoolean(false)
+        val watcher = launch(start = CoroutineStart.UNDISPATCHED) {
+            try {
+                awaitCancellation()
+            } finally {
+                if (!finished.get()) call.cancel()
+            }
+        }
+        try {
+            block()
         } finally {
-            cancelHandle?.dispose()
+            finished.set(true)
+            watcher.cancel()
         }
     }
 

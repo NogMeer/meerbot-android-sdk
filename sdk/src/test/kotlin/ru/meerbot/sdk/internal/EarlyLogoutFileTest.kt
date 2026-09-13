@@ -2,7 +2,6 @@ package ru.meerbot.sdk.internal
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -10,10 +9,11 @@ import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import ru.meerbot.sdk.network.StoreErrorReporter
 import java.io.File
+import java.util.UUID
 
 /**
  * Выход до `configure` на диске. Два экземпляра над одним каталогом — это два процесса
- * приложения: `SharedPreferences` каждого держали бы свой кэш, файл читается заново.
+ * приложения: `SharedPreferences` каждого держали бы свой кэш, каталог читается заново.
  */
 class EarlyLogoutFileTest {
 
@@ -30,11 +30,12 @@ class EarlyLogoutFileTest {
         val file = store()
         val mark = file.mark()!!
 
-        assertEquals(mark.marker, file.read())
+        assertEquals(listOf(mark.marker), file.read())
         file.clear("чужой")
-        assertEquals(mark.marker, file.read())
+        file.clear(UUID.randomUUID().toString())
+        assertEquals(listOf(mark.marker), file.read())
         file.clear(mark.marker)
-        assertNull(file.read())
+        assertTrue(file.read().isEmpty())
         assertTrue(errors.isEmpty())
     }
 
@@ -47,36 +48,71 @@ class EarlyLogoutFileTest {
         val a = store()
         val b = store()
         val mark = a.mark()!!
-        assertEquals(mark.marker, b.read())
+        assertEquals(listOf(mark.marker), b.read())
 
         a.clear(mark.marker)
 
-        assertNull(b.read())
+        assertTrue(b.read().isEmpty())
     }
 
-    /** Отметка, записанная в полёте другим вызовом или процессом, переживает снятие чужой. */
+    /**
+     * Два процесса пишут отметки одновременно: у каждой свой файл (и свой временный файл), и
+     * снятие одной не трогает другую. С одним общим файлом вторая запись затирала первую, а
+     * снятие «прочитать и удалить» могло удалить соседа, записанного между чтением и удалением.
+     */
     @Test
-    fun `снимается только своя отметка`() {
+    fun `снимается только своя отметка, выход ждёт, пока есть хоть одна`() {
         val a = store()
         val b = store()
         val first = a.mark()!!
         val second = b.mark()!!
 
+        assertEquals(listOf(first.marker, second.marker).sorted(), a.read())
+        assertEquals(
+            listOf(first.marker, second.marker).map { "meerbot_sdk_logout.$it" }.sorted(),
+            folder.root.list()!!.sorted(),
+        )
+
         a.clear(first.marker)
 
-        assertEquals(second.marker, a.read())
+        assertEquals(listOf(second.marker), b.read())
     }
 
     @Test
     fun `сброс делает прежние отметки недействительными`() {
         val file = store()
         val mark = file.mark()!!
+        store().mark()
+        // Временный файл записи, оборванной убийством процесса.
+        File(folder.root, "meerbot_sdk_logout.${UUID.randomUUID()}.tmp").writeText("x")
 
         file.clearAll()
 
         assertFalse(file.isIntact(mark))
-        assertNull(file.read())
+        assertTrue(file.read().isEmpty())
+        assertTrue(folder.root.list()!!.isEmpty())
         assertTrue(file.isIntact(file.mark()!!))
+    }
+
+    @Test
+    fun `временные и посторонние файлы отметкой не считаются`() {
+        File(folder.root, "meerbot_sdk_logout.${UUID.randomUUID()}.tmp").writeText("x")
+        File(folder.root, "meerbot_sdk_logout.garbage").writeText("x")
+        File(folder.root, "meerbot_sdk_logout").writeText(UUID.randomUUID().toString())
+
+        assertTrue(store().read().isEmpty())
+    }
+
+    /** Маркер попадает в имя файла: собрать из него путь за пределы каталога нельзя. */
+    @Test
+    fun `маркер с путём ничего не удаляет`() {
+        val sdkDir = folder.newFolder("sdk")
+        File(sdkDir, "meerbot_sdk_logout..").mkdir()
+        val victim = folder.newFile("victim")
+
+        store(sdkDir).clear("./../../victim")
+
+        assertTrue(victim.exists())
     }
 
     /** Хост отключил инициализатор: контекста нет, писать некуда — без исключения. */
@@ -85,8 +121,8 @@ class EarlyLogoutFileTest {
         val file = EarlyLogoutFile({ null }, reporter)
 
         assertNull(file.mark())
-        assertNull(file.read())
-        file.clear("x")
+        assertTrue(file.read().isEmpty())
+        file.clear(UUID.randomUUID().toString())
         file.clearAll()
         assertTrue(errors.isEmpty())
     }
@@ -101,9 +137,8 @@ class EarlyLogoutFileTest {
 
     @Test
     fun `временный файл не остаётся после записи`() {
-        store().mark()
+        val mark = store().mark()!!
 
-        assertNotNull(File(folder.root, "meerbot_sdk_logout").takeIf { it.exists() })
-        assertEquals(listOf("meerbot_sdk_logout"), folder.root.list()!!.toList())
+        assertEquals(listOf("meerbot_sdk_logout.${mark.marker}"), folder.root.list()!!.toList())
     }
 }

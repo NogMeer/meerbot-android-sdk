@@ -786,6 +786,92 @@ class ChatControllerTest {
         assertEquals(listOf(7L, 8L), state.messages.map { it.serverId })
     }
 
+    /**
+     * Часы устройства спешат больше допуска, тред пуст, отправка оборвана, а сервер сообщение и
+     * ответ записал. До правки эхо не узнавалось по времени: «Повторить» на доставленном
+     * сообщении, серверная копия рядом и недописанный пузырь — повтор дал бы дубль и второй
+     * платный ответ.
+     */
+    @Test
+    fun `обрыв при спешащих часах и пустом треде засчитывается доставкой`() {
+        val dispatcher = ScriptedDispatcher().also { server.dispatcher = it }
+        val controller = controller()
+        controller.start()
+        await(controller) { it.ready }
+        val serverNow = System.currentTimeMillis() - 6 * 60 * 1000L
+        dispatcher.historyFallback = {
+            ScriptedDispatcher.history(
+                messages = """{"id":7,"role":"user","content":"привет","createdAt":"${iso(serverNow)}"},
+                   {"id":8,"role":"assistant","content":"Здравствуйте","createdAt":"${iso(serverNow)}"}""",
+            )
+        }
+        dispatcher.streamFallback = { brokenStream(metaFrame) }
+
+        controller.send("привет")
+
+        await(controller) { s ->
+            !s.sending && s.messages.any { it.serverId == 8L } && s.messages.none { it.content == "нача" }
+        }
+        val state = controller.state.value
+        assertNull(state.retryable)
+        assertEquals(listOf("привет", "Здравствуйте"), state.messages.map { it.content })
+        assertEquals(listOf(7L, 8L), state.messages.map { it.serverId })
+        assertTrue(state.messages.none { it.failed })
+    }
+
+    /**
+     * Экран закрыли (`stop()`), пока сообщение отправлялось и эха ещё нет. Раньше отмена только
+     * убирала пузырь: сообщение оставалось без пометки и без «Повторить». Паритет с iOS.
+     */
+    @Test
+    fun `закрытие экрана во время отправки помечает сообщение недоставленным`() {
+        val dispatcher = ScriptedDispatcher().also { server.dispatcher = it }
+        val controller = controller()
+        controller.start()
+        await(controller) { it.ready }
+        val streamGate = dispatcher.gateNextStream(ScriptedDispatcher.sse(answerStream))
+        controller.send("привет")
+        dispatcher.awaitStream()
+
+        controller.stop()
+
+        await(controller) { it.retryable != null }
+        val state = controller.state.value
+        assertEquals("привет", state.retryable)
+        assertEquals(listOf("привет"), state.messages.map { it.content })
+        assertTrue(state.messages.single().failed)
+        assertNull(state.connectionError)
+        assertTrue(!state.sending)
+        streamGate.countDown()
+    }
+
+    /** Эхо сообщения уже в ленте — оно доставлено: повтор отправил бы его второй раз. */
+    @Test
+    fun `закрытие экрана после эха сообщения повтор не предлагает`() {
+        val dispatcher = ScriptedDispatcher().also { server.dispatcher = it }
+        val echoOnly = """{"id":7,"role":"user","content":"привет","createdAt":"${iso()}"}"""
+        val historyGate = dispatcher.gateNextHistory(ScriptedDispatcher.history(messages = echoOnly))
+        val streamGate = dispatcher.gateNextStream(ScriptedDispatcher.sse(answerStream))
+        val controller = controller()
+        controller.start()
+        dispatcher.awaitHistory()
+        controller.send("привет")
+        dispatcher.awaitStream()
+        historyGate.countDown()
+        await(controller) { it.ready }
+        assertEquals(7L, controller.state.value.messages.single { it.role == "user" }.serverId)
+
+        controller.stop()
+
+        await(controller) { s -> s.messages.none { it.role == "assistant" } }
+        awaitControllerIdle()
+        val state = controller.state.value
+        assertNull(state.retryable)
+        assertEquals(listOf(7L), state.messages.map { it.serverId })
+        assertTrue(state.messages.none { it.failed })
+        streamGate.countDown()
+    }
+
     /** Смена пользователя по-прежнему уносит и то, что ещё отправляется. */
     @Test
     fun `смена пользователя убирает и неотправленное сообщение`() {
@@ -804,6 +890,8 @@ class ChatControllerTest {
         streamGate.countDown()
         await(controller) { it.ready }
         assertTrue(controller.state.value.messages.isEmpty())
+        // Отмена отправки прежнего пользователя «Повторить» новому не ставит.
+        assertNull(controller.state.value.retryable)
     }
 
     @Test

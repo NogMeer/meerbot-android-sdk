@@ -166,8 +166,8 @@ object MeerBot {
         // Инициализатор уже дал контекст при старте процесса; здесь — для хоста, отключившего его.
         EarlyLogout.attach(appContext)
         // Выход до настройки — из прошлого запуска или другого процесса. Читается здесь, с диска.
-        val earlyMarker = EarlyLogout.file.read()
-        mainThread.execute { applyConfiguration(store, configuration, httpClient, earlyMarker) }
+        val earlyMarkers = EarlyLogout.file.read()
+        mainThread.execute { applyConfiguration(store, configuration, httpClient, earlyMarkers) }
     }
 
     @MainThread
@@ -175,8 +175,14 @@ object MeerBot {
         store: SharedPreferences,
         configuration: MeerBotConfiguration,
         httpClient: OkHttpClient,
-        earlyMarker: String?,
+        earlyMarkers: List<String>,
     ) {
+        // Повторный configure: прежний клиент делит с новым флаг выхода в тех же prefs, но не
+        // счётчики. Ответ, пришедший ему позже, стёр бы флаг на диске, пока новый держит его
+        // только в памяти, — и убитый процесс забыл бы выход. Прежний экран останавливается:
+        // его поток и догон принадлежат заменённой сессии.
+        client?.retire()
+        controller?.stop()
         prefs = store
         val uuid = getOrCreate(store, KEY_VISITOR_UUID) { UUID.randomUUID().toString() }
         // Идентификатор установки уходит в `deviceToken` рукопожатия и определяет, чей это
@@ -206,14 +212,15 @@ object MeerBot {
         // Выход до configure — в этом процессе или в прошлом — применяется раньше токена:
         // `identify(null)`, затем `identify(B)` до настройки дают одно рукопожатие с `logout`
         // и токеном B, как и после неё.
-        val early = earlyMarker?.takeUnless { it in appliedEarlyMarkers }
-        if (pendingLogout || early != null) {
+        val early = earlyMarkers.filterNot { it in appliedEarlyMarkers }
+        if (pendingLogout || early.isNotEmpty()) {
             // Флаг клиента — на диск синхронно ДО снятия ранней отметки: процесс, убитый между
             // ними, иначе забыл бы выход. Запись редкая — только когда выход до настройки был.
             apiClient.persistLogoutIntent()
             coordinator.apply(null)
             pendingLogout = false
-            early?.let {
+            // Снимаются только прочитанные отметки: записанные позже (другим процессом) остаются.
+            early.forEach {
                 appliedEarlyMarkers += it
                 EarlyLogout.file.clear(it)
             }
@@ -303,11 +310,15 @@ object MeerBot {
      * асинхронно — к возврату из метода оно может быть ещё не применено.
      *
      * Выход пишется на диск синхронно, ещё на потоке вызывающего (одна короткая запись на
-     * выход), и переживает убийство процесса сразу после вызова. До `configure(...)` вызов
+     * выход), и переживает убийство процесса сразу после вызова. С главного потока это
+     * синхронная запись на диск (`commit()`, StrictMode `DiskWrite`) — сознательно: отложенная
+     * запись теряла бы выход при убийстве процесса. До `configure(...)` вызов
      * запоминается и применяется при настройке; выход и тогда на диске (контекст приложения SDK
      * получает при старте процесса через `androidx.startup`) и переживает перезапуск, даже если
      * `configure` в этом процессе так и не позовут. Если хост отключил инициализатор SDK, выход
-     * до `configure` живёт только в памяти процесса.
+     * до `configure` живёт только в памяти процесса. Так же — в процессе, отличном от
+     * основного (`android:process=":remote"`): провайдер `androidx.startup` там не создаётся, и
+     * до первого `configure` в этом процессе контекста у SDK нет.
      */
     fun identify(token: String?) {
         val intent = if (token == null) persistLogoutIntent() else null
@@ -418,6 +429,8 @@ object MeerBot {
 
     @MainThread
     private fun applyReset() {
+        // Ответ, пришедший сброшенному клиенту, не должен трогать флаг выхода следующей настройки.
+        client?.retire()
         controller?.stop()
         controller?.store?.resetForLogout()
         client = null
