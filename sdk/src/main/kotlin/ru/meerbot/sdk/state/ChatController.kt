@@ -49,7 +49,8 @@ class ChatController(
      * Фоновый догон остановлен: сессия не восстанавливается (`device_not_found` и `jwt_*` после
      * уже сделанного переподключения). Без остановки каждый тик — рукопожатие и две истории,
      * вечно и молча. Снимается повторным открытием экрана или удачным догоном по явному
-     * действию (отправка, `refresh()`, возврат из фона).
+     * действию (отправка, `refresh()`). Возврат из фона действием пользователя в чате не
+     * считается и остановленный догон не будит (паритет с iOS).
      */
     private var catchUpSuspended = false
 
@@ -145,6 +146,7 @@ class ChatController(
         val failed = store.messages.lastOrNull { it.failed && it.role == "user" }
         if (failed != null) {
             store.setFailed(failed.id, false)
+            store.markResent(failed.id)
             run(text, failed.id)
         } else {
             send(text)
@@ -169,7 +171,9 @@ class ChatController(
      */
     @MainThread
     fun onEnterForeground() {
-        if (!screenVisible || !store.state.value.ready) return
+        // Остановленный догон не будим: сессия не восстановилась, и каждый возврат из фона
+        // снова делал бы рукопожатие и две истории.
+        if (!screenVisible || !store.state.value.ready || catchUpSuspended) return
         scope.launch { catchUp(silent = true) }
         startPolling()
     }
@@ -407,7 +411,9 @@ class ChatController(
         // доставкой считаем только эхо ЭТОГО сообщения с ответом после него. Раньше хватало
         // «лента кончается ответом»: прошлый ответ бота выдавал недошедшее сообщение за
         // доставленное, замена ленты стирала его, и «Повторить» не было.
-        val items = runCatching { fetchHistory() }.getOrNull()
+        // Диалога нет (сервер не прислал `meta`) — сообщение до него не дошло, и лишний запрос
+        // истории ничего не решил бы (паритет с iOS).
+        val items = if (client.conversationId != null) runCatching { fetchHistory() }.getOrNull() else null
         // Пользователь сменился, пока шёл запрос: его новой ленте чужой «Повторить» не нужен.
         if (identityEpoch.get() != startedEpoch) return
         if (items != null) {
@@ -437,11 +443,15 @@ class ChatController(
      * него есть серверный ответ. Недописанный локальный пузырь тогда лишний — серверная
      * версия ответа уже в ленте, и без удаления пользователь видел бы ответ дважды.
      *
-     * Звать ПОСЛЕ слияния истории.
+     * Звать ПОСЛЕ слияния истории. Серверный id сообщения засчитывается, только если строка
+     * записана после отправки: слияние не отдаёт отправке старую строку с тем же текстом, а
+     * проверка здесь держит это правило и на случай его поломки — иначе вчерашнее «да» с
+     * ответом после него выдало бы недошедшее сообщение за доставленное без «Повторить».
      */
     private fun settleInterruptedReply(userMessageId: String, placeholderId: String): Boolean {
         val feed = store.messages
         val userServerId = feed.firstOrNull { it.id == userMessageId }?.serverId ?: return false
+        if (!store.isAfterSend(userMessageId, userServerId)) return false
         if (feed.none { it.role == "assistant" && (it.serverId ?: 0L) > userServerId }) return false
         if (feed.firstOrNull { it.id == placeholderId }?.serverId == null) {
             store.removeMessage(placeholderId)

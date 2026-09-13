@@ -353,14 +353,14 @@ class ApiClientTest {
 
     /**
      * Хост выпускает токен на каждый вход в чат. Ответ со старым токеном того же человека не
-     * чужой: он сохраняется, а свежий токен применяется повтором — и частые обновления не
-     * превращаются в отмену, из-за которой терялась отправка.
+     * чужой: его JWT отдаётся ждущему запросу, но не кэшируется. Повтора нет — он съедал бы
+     * попытку и делал лишний `/register`; свежий токен уходит со следующим рукопожатием.
      */
     @Test
-    fun `свежие токены того же пользователя в полёте не отменяют рукопожатие`() = runBlocking {
+    fun `свежий токен того же пользователя в полёте не повторяет рукопожатие и не кэширует ответ`() = runBlocking {
         val dispatcher = gated()
-        val first = dispatcher.gateNextRegister(registerResponse(jwt = "jwt-1"))
-        val second = dispatcher.gateNextRegister(registerResponse(jwt = "jwt-2"))
+        val first = dispatcher.gateNextRegister(registerResponse(jwt = "jwt-1", identityStatus = "rejected"))
+        dispatcher.registerFallback = { registerResponse(jwt = "jwt-2", identityStatus = "verified") }
         val api = client()
         api.setIdentityToken("A1")
 
@@ -369,14 +369,100 @@ class ApiClientTest {
             dispatcher.awaitRegister()
             api.refreshIdentityToken("A2")
             first.countDown()
-            assertEquals("A2", JSONObject(dispatcher.awaitRegister().body.readUtf8()).getString("identityToken"))
-            api.refreshIdentityToken("A3")
-            second.countDown()
             pending.await()
         }
 
-        assertEquals("jwt-2", token)
+        assertEquals("jwt-1", token)
+        assertEquals(1, server.requestCount)
+        // Статус прежнего токена не публикуется: хост уже передал свежий.
+        assertEquals(IdentityStatus.NotProvided, api.identityStatus)
+
+        assertEquals("jwt-2", api.validToken())
+        assertEquals(IdentityStatus.from("verified"), api.identityStatus)
+        assertEquals("A2", JSONObject(dispatcher.awaitRegister().body.readUtf8()).getString("identityToken"))
         assertEquals(2, server.requestCount)
+    }
+
+    /**
+     * `identify(null)` записал выход на диск, пока летело рукопожатие с прежним выходом. Ответ
+     * на прежний не имеет права снять новый: главный поток его ещё не применил, и убитый в этом
+     * окне процесс забыл бы выход.
+     */
+    @Test
+    fun `выход, записанный в полёте, не снимается ответом на прежний`() = runBlocking {
+        val flag = InMemoryLogoutFlagStore()
+        val dispatcher = gated()
+        val gate = dispatcher.gateNextRegister(registerResponse(unlinked = true))
+        val api = client(flag)
+        api.logout()
+
+        withContext(Dispatchers.Default) {
+            val pending = async { api.openSession() }
+            assertTrue(JSONObject(dispatcher.awaitRegister().body.readUtf8()).getBoolean("logout"))
+            api.persistLogoutIntent()
+            gate.countDown()
+            pending.await()
+        }
+
+        assertTrue(flag.pending)
+    }
+
+    @Test
+    fun `новый токен сбрасывает диалог, курсор и статус прежней identity`() = runBlocking {
+        server.enqueue(registerResponse(identityStatus = "verified"))
+        val api = client()
+        api.setIdentityToken("A")
+        api.openSession()
+        api.rememberConversationId(77)
+        assertTrue(api.identityStatus != IdentityStatus.NotProvided)
+
+        api.setIdentityToken("B")
+
+        assertNull(api.conversationId)
+        assertNull(api.lastMessageId)
+        assertEquals(IdentityStatus.NotProvided, api.identityStatus)
+    }
+
+    /** Поток прежнего человека дописал `meta` уже после смены: диалог новому не достаётся. */
+    @Test
+    fun `поздний meta потока прежней identity не пишет диалог`() = runBlocking {
+        val dispatcher = gated()
+        val streamGate = dispatcher.gateNextStream(
+            sse("event: meta\ndata: {\"conversationId\":3,\"mode\":\"ai\"}\n\ndata: [DONE]\n\n"),
+        )
+        val api = client()
+
+        val events = withContext(Dispatchers.Default) {
+            val pending = async { api.sendMessage("привет").toList() }
+            dispatcher.awaitStream()
+            api.setIdentityToken("B")
+            streamGate.countDown()
+            pending.await()
+        }
+
+        assertTrue(events.any { it is ChatStreamEvent.Meta })
+        assertNull(api.conversationId)
+    }
+
+    @Test
+    fun `страница истории прежней identity не двигает курсор`() = runBlocking {
+        val dispatcher = gated()
+        val gate = dispatcher.gateNextHistory(
+            ScriptedDispatcher.history(
+                messages = """{"id":9,"role":"assistant","content":"x","createdAt":"2026-08-14T10:00:00.000Z"}""",
+            ),
+        )
+        val api = client()
+
+        withContext(Dispatchers.Default) {
+            val pending = async { api.history() }
+            dispatcher.awaitHistory()
+            api.setIdentityToken("B")
+            gate.countDown()
+            pending.await()
+        }
+
+        assertNull(api.lastMessageId)
     }
 
     @Test

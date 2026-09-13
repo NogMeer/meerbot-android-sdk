@@ -77,6 +77,11 @@ dependencies {
     // транзитивом от activity-compose.
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
 
+    // Контекст приложения до configure (выход до настройки переживает процесс). Новой ноши
+    // для хоста нет: ровно эта версия уже приезжает транзитивом (compose → emoji2 /
+    // lifecycle-process), объявлена явно по той же причине, что корутины и lifecycle выше.
+    implementation("androidx.startup:startup-runtime:1.1.1")
+
     // Networking
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.squareup.okhttp3:okhttp-sse:4.12.0")

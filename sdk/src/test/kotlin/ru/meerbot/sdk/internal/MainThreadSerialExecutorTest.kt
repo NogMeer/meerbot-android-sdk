@@ -71,6 +71,38 @@ class MainThreadSerialExecutorTest {
         assertEquals(listOf("logout@$MAIN", "identify-B@$MAIN"), log)
     }
 
+    /**
+     * Сброс ленты уведомил подписчика хоста, и тот прямо из колбэка зовёт `identify`. Выполнись
+     * вложенный вызов сразу, он применился бы посреди внешнего — над наполовину изменённым
+     * состоянием.
+     */
+    @Test
+    fun `вложенный вызов из блока выполняется после него`() {
+        main.submit {
+            executor.execute {
+                record("outer-start")
+                executor.execute { record("nested") }
+                record("outer-end")
+            }
+        }.get(5, TimeUnit.SECONDS)
+        drainMain()
+
+        assertEquals(listOf("outer-start@$MAIN", "outer-end@$MAIN", "nested@$MAIN"), log)
+    }
+
+    /** Вызов с главного потока после вложенного встаёт за ним, а не проскакивает вперёд. */
+    @Test
+    fun `вызов после вложенного встаёт за ним`() {
+        main.submit {
+            executor.execute { executor.execute { record("nested") } }
+            executor.execute { record("next") }
+        }.get(5, TimeUnit.SECONDS)
+        drainMain()
+        drainMain()
+
+        assertEquals(listOf("nested@$MAIN", "next@$MAIN"), log)
+    }
+
     @Test
     fun `с главного потока при пустой очереди — сразу`() {
         val ranInline = main.submit<Boolean> {

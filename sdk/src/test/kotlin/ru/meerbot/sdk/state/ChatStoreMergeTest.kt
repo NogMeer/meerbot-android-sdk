@@ -216,6 +216,77 @@ class ChatStoreMergeTest {
         assertEquals(local.id, store.messages[2].id)
     }
 
+    /**
+     * Пользователь написал «да» до прихода стартовой истории, а в истории — вчерашнее «да» с
+     * ответом. До правки вчерашняя строка забирала новое сообщение: сама пропадала из ленты,
+     * обрыв засчитывался доставкой по её id, а настоящее эхо вставало вторым «да».
+     */
+    @Test
+    fun `вчерашнее сообщение с тем же текстом не забирает неотправленное`() {
+        val store = ChatStore()
+        val local = store.appendUserMessage("да")
+
+        store.mergeServerMessages(
+            listOf(
+                serverMessage(5, role = "user", text = "да", at = yesterday),
+                serverMessage(6, text = "Хорошо", at = yesterday + 1_000),
+            ),
+        )
+
+        assertEquals(listOf(5L, 6L, null), store.messages.map { it.serverId })
+        assertEquals(local.id, store.messages[2].id)
+
+        store.mergeServerMessages(listOf(serverMessage(40, role = "user", text = "да")))
+
+        assertEquals(listOf(5L, 6L, 40L), store.messages.map { it.serverId })
+        assertEquals(local.id, store.messages[2].id)
+        assertEquals(2, store.messages.count { it.content == "да" })
+    }
+
+    /**
+     * Курсор на момент отправки известен: эхо — только строка новее него, даже если по времени
+     * старая строка «свежая» (догон принёс её позже, чем курсор ушёл вперёд).
+     */
+    @Test
+    fun `строка не новее курсора на момент отправки не эхо`() {
+        val store = ChatStore()
+        store.mergeServerMessages(listOf(serverMessage(7, text = "ответ")))
+        val local = store.appendUserMessage("да")
+
+        store.mergeServerMessages(listOf(serverMessage(6, role = "user", text = "да")))
+        assertNull(store.messages.single { it.id == local.id }.serverId)
+
+        store.mergeServerMessages(listOf(serverMessage(8, role = "user", text = "да")))
+        assertEquals(8L, store.messages.single { it.id == local.id }.serverId)
+    }
+
+    @Test
+    fun `повтор сдвигает порог эха к курсору на момент повтора`() {
+        val store = ChatStore()
+        val local = store.appendUserMessage("да")
+        store.setFailed(local.id, true)
+        store.mergeServerMessages(listOf(serverMessage(9, text = "другое")))
+
+        store.markResent(local.id)
+        store.mergeServerMessages(listOf(serverMessage(8, role = "user", text = "да")))
+
+        assertNull(store.messages.single { it.id == local.id }.serverId)
+    }
+
+    /** Сообщение дошло — «Повторить» отправил бы его второй раз. */
+    @Test
+    fun `эхо недоставленного снимает текст повтора`() {
+        val store = ChatStore()
+        val local = store.appendUserMessage("привет")
+        store.setFailed(local.id, true)
+        store.setRetryable("привет")
+
+        store.mergeServerMessages(listOf(serverMessage(7, role = "user", text = "привет")))
+
+        assertFalse(store.messages.single().failed)
+        assertNull(store.state.value.retryable)
+    }
+
     /** Два одинаковых неотправленных сообщения: эхо достаётся каждому по порядку, без дублей. */
     @Test
     fun `одинаковые сообщения промоутятся по порядку`() {

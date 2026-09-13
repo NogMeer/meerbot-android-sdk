@@ -112,8 +112,8 @@ MeerBot.identityStatus()          // verified / stale / rejected / not_configure
 пустым, лента очищается сразу. Токен другого пользователя отвязывает прежнего и без выхода;
 свежий токен того же пользователя ленту не трогает; повторный вход со свежим токеном
 возвращает прежний тред. Сигнал выхода переживает перезапуск, в том числе запрошенный до
-`configure` — контекст приложения SDK получает своим `ContentProvider`
-(`ru.meerbot.sdk.internal.MeerBotContextProvider`). Сервер, не знающий выхода, сигнал
+`configure` — контекст приложения SDK получает через `androidx.startup`
+(`ru.meerbot.sdk.internal.MeerBotInitializer`). Сервер, не знающий выхода, сигнал
 игнорирует — там устройство остаётся за последним вошедшим, как в 0.2.8. Зовите `null`
 **только на настоящем выходе**.
 
@@ -214,7 +214,7 @@ unit-тесты не видят: что экран действительно п
 ```
 sdk/src/main/kotlin/ru/meerbot/sdk/
   MeerBot.kt                        публичный фасад
-  internal/                         очередь главного потока, ContentProvider контекста
+  internal/                         очередь главного потока, выход до configure (androidx.startup)
   network/MeerBotConfiguration.kt   ключ, адрес платформы, статусы identity
   network/ApiClient.kt              рукопожатие, JWT, SSE-поток, история, выход
   network/IdentityCoordinator.kt    что значит очередной identify: вход, обновление, смена, выход

@@ -2,6 +2,7 @@ package ru.meerbot.sdk.network
 
 import android.content.SharedPreferences
 import android.util.Log
+import java.io.IOException
 import java.security.GeneralSecurityException
 
 /**
@@ -14,6 +15,11 @@ import java.security.GeneralSecurityException
  */
 internal interface LogoutFlagStore {
     var pending: Boolean
+
+    /** Поставить флаг и дождаться записи на диск (если хранилище дисковое). */
+    fun persistPending() {
+        pending = true
+    }
 }
 
 /** Флаг в памяти процесса: для тестов и для [ApiClient], собранного хостом напрямую. */
@@ -63,6 +69,8 @@ internal class PrefsLogoutFlagStore(
         get() = value.get()
         set(pending) = value.set(pending)
 
+    override fun persistPending() = value.set(true, durable = true)
+
     companion object {
         const val KEY = "pending_logout"
     }
@@ -100,9 +108,11 @@ internal class PrefsSubjectHashStore(
  * в лог машинным кодом, а значение берётся из памяти: записанное в этом процессе — главнее
  * диска (при исправном хранилище они совпадают), не записанное — умолчание.
  *
- * Запись — `apply()`: in-memory карта prefs обновляется сразу, диск пишется в фоне и
- * досылается системой на `onPause`/остановке сервиса. `commit()` держал бы главный поток на
- * диске (StrictMode DiskWrite), и не просто так, а под замком сессии клиента.
+ * Запись по умолчанию — `apply()`: in-memory карта prefs обновляется сразу, диск пишется в
+ * фоне и досылается системой на `onPause`/остановке сервиса. `commit()` держал бы главный
+ * поток на диске (StrictMode DiskWrite), и не просто так, а под замком сессии клиента.
+ * `durable = true` — `commit()` на потоке вызывающего, вне замка сессии: для редкой записи,
+ * которая обязана пережить убийство процесса сразу после вызова (выход пользователя).
  */
 private class PrefsValue<T>(
     private val prefs: SharedPreferences,
@@ -132,13 +142,18 @@ private class PrefsValue<T>(
         }
     }
 
-    fun set(value: T) {
+    fun set(value: T, durable: Boolean = false) {
         synchronized(lock) {
             memory = value
             written = true
         }
         try {
-            prefs.edit().write(key, value).apply()
+            val editor = prefs.edit().write(key, value)
+            if (!durable) {
+                editor.apply()
+            } else if (!editor.commit()) {
+                onError.report("${errorPrefix}_write_failed", IOException("commit() returned false"))
+            }
         } catch (e: SecurityException) {
             onError.report("${errorPrefix}_write_failed", e)
         } catch (e: GeneralSecurityException) {

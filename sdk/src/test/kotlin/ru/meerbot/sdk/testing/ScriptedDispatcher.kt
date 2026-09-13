@@ -56,6 +56,9 @@ class ScriptedDispatcher : Dispatcher() {
     fun awaitHistory(): RecordedRequest =
         historyArrivals.poll(5, TimeUnit.SECONDS) ?: failWith("запрос истории не пришёл")
 
+    /** Сколько запросов истории пришло и ещё не забрано `awaitHistory`. */
+    fun historyArrivalCount(): Int = historyArrivals.size
+
     fun clearArrivals() {
         registerArrivals.clear()
         historyArrivals.clear()

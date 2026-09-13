@@ -109,11 +109,18 @@ class ApiClient internal constructor(
 
     /**
      * Ревизия токена того же человека ([refreshIdentityToken]). Отдельно от [generation]: ответ,
-     * полученный со старым токеном ТОГО ЖЕ пользователя, чужим не является и сохраняется, а
-     * свежий токен применяется повтором, если попытка осталась. Хост, выпускающий токен на
-     * каждый вход в чат, иначе исчерпал бы попытки и потерял бы отправленное сообщение.
+     * полученный со старым токеном ТОГО ЖЕ пользователя, чужим не является — его JWT отдаётся
+     * ждущему запросу, но не кэшируется, и следующий запрос зарегистрируется уже со свежим
+     * токеном. Повтора нет: он съедал бы попытку и делал лишний `/register` (паритет с iOS).
      */
     private var tokenRevision = 0
+
+    /**
+     * Ревизия записанного выхода ([persistLogoutIntent]). Рукопожатие снимает флаг, только если
+     * за время запроса выход не записали снова: иначе ответ на прежний выход стёр бы новый,
+     * записанный на диск до того, как главный поток его применил.
+     */
+    private var logoutIntent = 0
 
     @Volatile
     private var jwt: String? = null
@@ -154,12 +161,18 @@ class ApiClient internal constructor(
      *
      * `null` здесь — только «токена нет», устройство от пользователя НЕ отвязывается: сервер
      * держит связь, пока не придёт явный выход (`MeerBot.identify(null)`).
+     *
+     * Диалог, курсор и статус identity сбрасываются: они описывают прежнюю identity (паритет с
+     * iOS — любая смена, кроме свежего токена того же человека).
      */
     fun setIdentityToken(token: String?) {
         synchronized(sessionLock) {
             identityToken = token
             generation++
             invalidateToken()
+            conversationId = null
+            lastMessageId = null
+            identityStatus = IdentityStatus.NotProvided
         }
     }
 
@@ -199,6 +212,18 @@ class ApiClient internal constructor(
     }
 
     /**
+     * Записать выход на диск СИНХРОННО (`commit()`), на потоке вызывающего `identify(null)`, до
+     * постановки вызова в очередь главного потока. Запись `apply()` из [beginNewIdentity]
+     * ложится на диск позже, и процесс, убитый в этом окне, забыл бы выход: следующий человек
+     * открыл бы тред прежнего. Запись редкая — раз на выход. Сбой хранилища пишется в лог
+     * (`logout_flag_write_failed`), флаг остаётся в памяти процесса.
+     */
+    internal fun persistLogoutIntent() {
+        synchronized(sessionLock) { logoutIntent++ }
+        logoutFlag.persistPending()
+    }
+
+    /**
      * Флаг, поколение и клиентское состояние прежнего человека меняются под одним замком: иначе
      * рукопожатие, закончившееся между записью флага и сменой поколения, сняло бы только что
      * поставленный флаг (его запрос ушёл без `logout`). Запись флага — `apply()` на
@@ -221,25 +246,20 @@ class ApiClient internal constructor(
     suspend fun openSession(): MobileSession = tokenMutex.withLock { openSessionLocked() }
 
     private suspend fun openSessionLocked(): MobileSession {
-        // Сессия, уже сохранённая в этом вызове, и поколение, в котором её сохранили. Ответ
-        // получен токеном того же человека: если повтор со свежим токеном не удался, отдаём её,
-        // а не ошибку. Но только пока поколение то же — после смены человека она чужая.
-        var stored: MobileSession? = null
-        var storedIn = -1
-        fun storedIfCurrent(): MobileSession? =
-            stored?.takeIf { synchronized(sessionLock) { generation == storedIn } }
-
         // Поколение сменилось посреди запроса — ответ принадлежит прежней identity и
-        // отбрасывается. Повторов конечное число (паритет с iOS): хост, дёргающий identify() в
-        // цикле, не должен превратить рукопожатие в бесконечное.
+        // отбрасывается, запрос повторяется с новой. Повторов конечное число (паритет с iOS):
+        // хост, дёргающий identify() в цикле, не должен превратить рукопожатие в бесконечное.
+        // Свежий токен того же человека повтора не требует (см. [tokenRevision]).
         repeat(MAX_REGISTER_ATTEMPTS) {
             val startedIn: Int
             val startedRevision: Int
+            val startedIntent: Int
             val token: String?
             val logoutSent: Boolean
             synchronized(sessionLock) {
                 startedIn = generation
                 startedRevision = tokenRevision
+                startedIntent = logoutIntent
                 token = identityToken
                 logoutSent = logoutFlag.pending
             }
@@ -257,30 +277,16 @@ class ApiClient internal constructor(
                 .post(body.toString().toRequestBody(JSON))
                 .build()
 
-            val raw = try {
-                execute(request)
-            } catch (e: MeerBotError) {
-                storedIfCurrent()?.let { return it }
-                throw e
-            }
+            val raw = execute(request)
             // Поколение сверяется ДО разбора: ответ прежней identity — чужой, будь он хоть
             // битым, хоть отказом. Бросить его ошибку значило бы показать новому человеку
             // провал запроса, которого он не делал, вместо повтора с его токеном.
             if (synchronized(sessionLock) { generation != startedIn }) return@repeat
 
-            val session = try {
-                parseSession(raw, logoutSent, startedIn)
-            } catch (e: MeerBotError) {
-                storedIfCurrent()?.let { return it }
-                throw e
-            } ?: return@repeat
-            stored = session
-            storedIn = startedIn
-
-            val refreshed = synchronized(sessionLock) { tokenRevision != startedRevision }
-            if (!refreshed) return session
+            val session = parseSession(raw, logoutSent, startedIn, startedRevision, startedIntent)
+                ?: return@repeat
+            return session
         }
-        storedIfCurrent()?.let { return it }
         // Отмена, а не сетевая ошибка: рукопожатие перебили смены пользователя. Контроллер
         // считает её безобидной, только если сменилась и его эпоха.
         throw MeerBotError.Cancelled
@@ -290,7 +296,13 @@ class ApiClient internal constructor(
      * Разобрать ответ рукопожатия и сохранить сессию. `null` — пока разбирали, поколение
      * сменилось, и сессия не сохранена.
      */
-    private fun parseSession(raw: RawResponse, logoutSent: Boolean, startedIn: Int): MobileSession? {
+    private fun parseSession(
+        raw: RawResponse,
+        logoutSent: Boolean,
+        startedIn: Int,
+        startedRevision: Int,
+        startedIntent: Int,
+    ): MobileSession? {
         val json = parseJson(raw)
         val jwtValue = json.optStringOrNull("jwt") ?: throw MeerBotError.InvalidResponse
         val deviceId = json.optStringOrNull("deviceId") ?: throw MeerBotError.InvalidResponse
@@ -307,10 +319,16 @@ class ApiClient internal constructor(
 
         val committed = synchronized(sessionLock) {
             if (generation != startedIn) return@synchronized false
-            jwt = jwtValue
-            jwtExpiresAtMs = System.currentTimeMillis() + expiresIn * 1000L
-            identityStatus = status
-            if (logoutSent && unlinkedConfirmed) logoutFlag.pending = false
+            // Свежий токен того же человека пришёл в полёте: JWT отдаём ждущему запросу (связь
+            // та же), но не кэшируем — следующий запрос зарегистрируется со свежим токеном.
+            // Статус тоже не публикуем: он описывает прежний токен, а хост уже передал новый
+            // (паритет с iOS).
+            if (tokenRevision == startedRevision) {
+                jwt = jwtValue
+                jwtExpiresAtMs = System.currentTimeMillis() + expiresIn * 1000L
+                identityStatus = status
+            }
+            if (logoutSent && unlinkedConfirmed && logoutIntent == startedIntent) logoutFlag.pending = false
             true
         }
         if (!committed) return null
@@ -349,6 +367,7 @@ class ApiClient internal constructor(
      * клиенту нечем и незачем.
      */
     suspend fun history(since: Long? = null, limit: Int = 50): HistoryPage {
+        val startedIn = currentGeneration()
         val url = (config.baseUrl.trimEnd('/') + "/api/v1/mobile/messages").toHttpUrl()
             .newBuilder()
             .addQueryParameter("limit", limit.toString())
@@ -379,7 +398,10 @@ class ApiClient internal constructor(
                 createdAtMs = parseTimestamp(item.optStringOrNull("createdAt")),
             )
         }
-        messages.lastOrNull()?.let { lastMessageId = it.id }
+        // Страница, запрошенная до смены человека, курсор нового не двигает.
+        messages.lastOrNull()?.let { last ->
+            synchronized(sessionLock) { if (generation == startedIn) lastMessageId = last.id }
+        }
         // Режим приходит той же страницей: только так клиент узнаёт, что диалог закрыт или
         // уже ведёт менеджер, — рукопожатие канала режима не отдаёт.
         return HistoryPage(
@@ -401,13 +423,17 @@ class ApiClient internal constructor(
      * перепутан ключ, и новый токен будет ровно таким же.
      */
     fun sendMessage(text: String): Flow<ChatStreamEvent> = flow {
-        runStream(text, allowRetry = true, collector = this)
+        runStream(text, allowRetry = true, collector = this, startedIn = currentGeneration())
     }.flowOn(Dispatchers.IO)
 
+    private fun currentGeneration(): Int = synchronized(sessionLock) { generation }
+
+    /** @param startedIn поколение identity на момент отправки — см. [emit]. */
     private suspend fun runStream(
         text: String,
         allowRetry: Boolean,
         collector: FlowCollector<ChatStreamEvent>,
+        startedIn: Int,
     ) {
         val body = JSONObject().put("message", text)
 
@@ -440,7 +466,7 @@ class ApiClient internal constructor(
                     val error = decodeError(it.code, it.body?.string())
                     if (allowRetry && error.isExpiredToken) {
                         invalidateToken()
-                        runStream(text, allowRetry = false, collector = collector)
+                        runStream(text, allowRetry = false, collector = collector, startedIn = startedIn)
                         return
                     }
                     throw error
@@ -450,7 +476,7 @@ class ApiClient internal constructor(
                 try {
                     SseReader(source).read { raw ->
                         currentCoroutineContext().ensureActive()
-                        emit(raw, collector)
+                        emit(raw, collector, startedIn)
                     }
                 } catch (e: IOException) {
                     currentCoroutineContext().ensureActive()
@@ -462,13 +488,22 @@ class ApiClient internal constructor(
         }
     }
 
-    private suspend fun emit(raw: SseEvent, collector: FlowCollector<ChatStreamEvent>) {
+    /**
+     * Кадр потока. Диалог и курсор пишутся, только пока identity та же, что при отправке:
+     * поздний `meta` потока прежнего человека иначе вернул бы его `conversationId` новому
+     * (хост сверял бы с ним пуши). Сам кадр отдаётся всегда — ленту стережёт эпоха контроллера.
+     */
+    private suspend fun emit(raw: SseEvent, collector: FlowCollector<ChatStreamEvent>, startedIn: Int) {
         val event = ChatStreamEvent.from(raw) ?: return
-        if (event is ChatStreamEvent.Meta && event.conversationId > 0) {
-            conversationId = event.conversationId
-        }
-        if (event is ChatStreamEvent.Manager && event.message.messageId > 0) {
-            lastMessageId = event.message.messageId
+        synchronized(sessionLock) {
+            if (generation == startedIn) {
+                if (event is ChatStreamEvent.Meta && event.conversationId > 0) {
+                    conversationId = event.conversationId
+                }
+                if (event is ChatStreamEvent.Manager && event.message.messageId > 0) {
+                    lastMessageId = event.message.messageId
+                }
+            }
         }
         collector.emit(event)
     }

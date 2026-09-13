@@ -20,16 +20,13 @@ internal class IdentityCoordinator(
 
     @MainThread
     fun apply(token: String?): IdentityChange {
-        val newHash = token?.let { IdentitySubject.hash(installationId, IdentitySubject.key(it)) }
-        val change = IdentitySubject.change(subjects.hash, newHash)
-        if (token == null) {
-            client.logout()
-        } else {
-            when (change) {
-                IdentityChange.Switch -> client.switchIdentity(token)
-                IdentityChange.Refresh -> client.refreshIdentityToken(token)
-                IdentityChange.SignIn, IdentityChange.Logout -> client.setIdentityToken(token)
-            }
+        val subject = token?.let { IdentitySubject.of(it) }
+        val newHash = token?.let { IdentitySubject.hash(installationId, subject ?: it) }
+        val change = IdentitySubject.change(subjects.hash, newHash, newSubjectReadable = subject != null)
+        when {
+            token == null -> client.logout()
+            change == IdentityChange.Refresh -> client.refreshIdentityToken(token)
+            else -> client.switchIdentity(token)
         }
         // Хеш — после клиента: флаг выхода обязан лечь раньше, чем SDK «забудет» прежнего.
         subjects.hash = newHash

@@ -44,8 +44,8 @@ class IdentityCoordinatorTest {
         val flag = InMemoryLogoutFlagStore()
         val api = client(flag)
         val identity = coordinator(flag, api)
-        assertEquals(IdentityChange.SignIn, identity.apply(Jwt.withSub("user-A")))
-        assertFalse(flag.pending)
+        assertEquals(IdentityChange.Switch, identity.apply(Jwt.withSub("user-A")))
+        flag.pending = false // сервер подтвердил выход рукопожатием
         api.rememberConversationId(77)
 
         val change = identity.apply(Jwt.withSub("user-B"))
@@ -57,12 +57,57 @@ class IdentityCoordinatorTest {
         assertEquals(2, feedResets)
     }
 
+    /**
+     * Главный случай N2: X вошёл на 0.2.8 (хеша `sub` тогда не было). После обновления первым
+     * приходит токен Y. Без выхода сервер, отклонив Y (просрочен, лимит, не настроен секрет),
+     * оставил бы устройство за X — и Y читал бы его тред.
+     */
+    @Test
+    fun `первый токен после обновления с 0_2_8 без хеша ставит флаг выхода`() {
+        val flag = InMemoryLogoutFlagStore()
+        val api = client(flag)
+        api.rememberConversationId(77)
+
+        val change = coordinator(flag, api).apply(Jwt.withSub("user-Y"))
+
+        assertEquals(IdentityChange.Switch, change)
+        assertTrue(flag.pending)
+        assertNull(api.conversationId)
+        assertEquals(1, feedResets)
+    }
+
+    /** Хеш есть, но не читается (повреждённый keyset): неизвестно, кто вошёл прежде. */
+    @Test
+    fun `нечитаемый сохранённый хеш — выход и вход`() {
+        coordinator(InMemoryLogoutFlagStore()).apply(Jwt.withSub("user-X"))
+        prefs.failReads = true
+        val flag = InMemoryLogoutFlagStore()
+
+        val change = coordinator(flag).apply(Jwt.withSub("user-X", iat = 2))
+
+        assertEquals(IdentityChange.Switch, change)
+        assertTrue(flag.pending)
+    }
+
+    @Test
+    fun `токен без читаемого sub — выход и вход даже при той же строке`() {
+        val flag = InMemoryLogoutFlagStore()
+        val identity = coordinator(flag)
+        identity.apply("opaque-token")
+        flag.pending = false
+
+        assertEquals(IdentityChange.Switch, identity.apply("opaque-token"))
+        assertTrue(flag.pending)
+        assertEquals(2, feedResets)
+    }
+
     @Test
     fun `свежий токен того же пользователя флаг не ставит и ленту не чистит`() {
         val flag = InMemoryLogoutFlagStore()
         val api = client(flag)
         val identity = coordinator(flag, api)
         identity.apply(Jwt.withSub("user-A", iat = 1))
+        flag.pending = false // сервер подтвердил выход рукопожатием
         api.rememberConversationId(77)
 
         val change = identity.apply(Jwt.withSub("user-A", iat = 2))
@@ -97,8 +142,12 @@ class IdentityCoordinatorTest {
         assertTrue(prefs.values.values.none { it.toString().contains("user-42") })
     }
 
+    /**
+     * После выхода SDK не знает, кто войдёт: вход того же человека — снова выход и вход. Для
+     * сервера это безвредно: тот же `sub` со свежим токеном связь и тред сохраняет.
+     */
     @Test
-    fun `выход стирает хеш, и следующий вход — вход, а не смена`() {
+    fun `выход стирает хеш, и следующий вход — выход и вход`() {
         val flag = InMemoryLogoutFlagStore()
         val identity = coordinator(flag)
         identity.apply(Jwt.withSub("user-A"))
@@ -106,8 +155,10 @@ class IdentityCoordinatorTest {
         assertEquals(IdentityChange.Logout, identity.apply(null))
         assertTrue(flag.pending)
         assertNull(prefs.values[PrefsSubjectHashStore.KEY])
+        flag.pending = false
 
-        assertEquals(IdentityChange.SignIn, identity.apply(Jwt.withSub("user-A")))
+        assertEquals(IdentityChange.Switch, identity.apply(Jwt.withSub("user-A")))
+        assertTrue(flag.pending)
         assertEquals(3, feedResets)
     }
 

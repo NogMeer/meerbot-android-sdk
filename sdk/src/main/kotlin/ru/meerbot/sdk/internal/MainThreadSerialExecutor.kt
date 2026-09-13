@@ -13,9 +13,12 @@ import java.util.concurrent.atomic.AtomicInteger
  * двойной старт или потерянная запись `streamJob`, и поток прежнего пользователя продолжал
  * бы писать в очищенную ленту.
  *
- * С главного потока блок выполняется сразу, но только если в очереди ничего нет. Иначе он
- * встаёт за уже поставленными: `identify(null)` с фонового потока и следом `identify(B)` с
- * главного должны примениться в порядке вызова, а не «главный первым».
+ * С главного потока блок выполняется сразу, но только если в очереди ничего нет и другой блок
+ * сейчас не выполняется. Иначе он встаёт за уже поставленными: `identify(null)` с фонового
+ * потока и следом `identify(B)` с главного должны примениться в порядке вызова, а не «главный
+ * первым». Вложенный вызов — из самого блока (сброс ленты уведомил подписчика хоста, и тот
+ * зовёт `identify`) — тоже встаёт в очередь: выполнись он сразу, он применился бы посреди
+ * внешнего блока, над наполовину изменённым состоянием.
  */
 internal class MainThreadSerialExecutor(
     private val isMainThread: () -> Boolean,
@@ -23,9 +26,17 @@ internal class MainThreadSerialExecutor(
 ) {
     private val queued = AtomicInteger()
 
+    /** Блок выполняется прямо сейчас без очереди. Читается и пишется только главным потоком. */
+    private var runningInline = false
+
     fun execute(block: () -> Unit) {
-        if (isMainThread() && queued.get() == 0) {
-            block()
+        if (isMainThread() && queued.get() == 0 && !runningInline) {
+            runningInline = true
+            try {
+                block()
+            } finally {
+                runningInline = false
+            }
             return
         }
         queued.incrementAndGet()

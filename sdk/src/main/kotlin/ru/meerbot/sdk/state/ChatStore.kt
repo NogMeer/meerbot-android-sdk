@@ -6,6 +6,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Состояние экрана чата. Контракт совпадает с iOS ChatStore и RN reducer.
@@ -98,16 +99,40 @@ class ChatStore {
 
     fun setRetryable(text: String?) = _state.update { it.copy(retryable = text) }
 
+    /**
+     * Курсор ленты на момент появления локальной строки: id → `lastServerMessageId` тогда.
+     *
+     * Эхом строки может быть только серверная строка НОВЕЕ этого курсора: всё, что не новее,
+     * сервер записал до отправки. Без этого вчерашнее «да» из стартовой истории, пришедшей
+     * после отправки, забирало себе новое «да»: вчерашняя строка пропадала из ленты, обрыв
+     * засчитывался доставкой по её id (без «Повторить»), а настоящее эхо вставало вторым «да».
+     * Не в [ChatMessage]: новое поле публичного data-класса сломало бы его конструктор у хостов.
+     * Потокобезопасна: в тестах слияние идёт не с главного потока.
+     */
+    private val echoFloors = ConcurrentHashMap<String, Long>()
+
     fun appendUserMessage(content: String): ChatMessage {
         val msg = ChatMessage(role = "user", content = content)
         _state.update { it.copy(messages = it.messages + msg) }
+        rememberEchoFloor(msg.id)
         return msg
     }
 
     fun appendAssistantPlaceholder(): ChatMessage {
         val msg = ChatMessage(role = "assistant", author = "ai", content = "", streaming = true)
         _state.update { it.copy(messages = it.messages + msg) }
+        rememberEchoFloor(msg.id)
         return msg
+    }
+
+    /**
+     * Сообщение отправляется снова («Повторить»): его эхо обязано быть новее курсора на момент
+     * повтора. Всё, что уже в ленте, записано раньше и эхом этой отправки не является.
+     */
+    internal fun markResent(id: String) = rememberEchoFloor(id)
+
+    private fun rememberEchoFloor(id: String) {
+        echoFloors[id] = _state.value.lastServerMessageId
     }
 
     /**
@@ -136,15 +161,15 @@ class ChatStore {
         )
     }
 
-    fun appendOperatorMessage(content: String, authorName: String?) = _state.update {
-        it.copy(
-            messages = it.messages + ChatMessage(
-                role = "assistant",
-                author = "manager",
-                authorName = authorName,
-                content = content,
-            )
+    fun appendOperatorMessage(content: String, authorName: String?) {
+        val msg = ChatMessage(
+            role = "assistant",
+            author = "manager",
+            authorName = authorName,
+            content = content,
         )
+        _state.update { it.copy(messages = it.messages + msg) }
+        rememberEchoFloor(msg.id)
     }
 
     /** Пометить сообщение недоставленным (обрыв сети) либо снять пометку при повторе. */
@@ -188,11 +213,13 @@ class ChatStore {
      *
      * Проход 1, от новых строк страницы к старым — узнать своё:
      *   1. `serverId` уже в ленте — пропускаем (страница пришла повторно, это норма догона);
-     *   2. есть локальный двойник (тот же `role` и текст, ещё без серверного id) — ПРОМОУТИМ
-     *      его, а не добавляем второй: иначе своё же сообщение пользователь увидит дважды.
-     *      Идём от новых к старым, чтобы эхо забрала самая новая строка с этим текстом, а не
-     *      вчерашнее «ок» из полной истории. Стримящийся пузырь не промоутим: он ещё
-     *      дописывается, и серверная строка с тем же текстом — не его окончательная версия.
+     *   2. есть локальный двойник (тот же `role` и текст, ещё без серверного id, и строка
+     *      могла быть записана после его появления — см. [canBeEcho]) — ПРОМОУТИМ его, а не
+     *      добавляем второй: иначе своё же сообщение пользователь увидит дважды. Идём от
+     *      новых к старым, чтобы эхо забрала самая новая строка с этим текстом. Стримящийся
+     *      пузырь не промоутим: он ещё дописывается, и серверная строка с тем же текстом — не
+     *      его окончательная версия. Промоут недоставленного снимает и текст «Повторить»:
+     *      сообщение дошло, повтор отправил бы его второй раз.
      *
      * Проход 2, по порядку страницы — вставить остальное на своё место (см. [insertionIndex]),
      * а не в конец: стартовая история, пришедшая после отправки, старше отправленного
@@ -208,6 +235,7 @@ class ChatStore {
         _state.update { current ->
             val merged = current.messages.toMutableList()
             val recognized = HashSet<Int>()
+            var retryable = current.retryable
             for (index in items.indices.reversed()) {
                 val item = items[index]
                 if (item.serverId != null && merged.any { it.serverId == item.serverId }) {
@@ -216,7 +244,11 @@ class ChatStore {
                 }
                 val localIdx = indexOfLocalTwin(merged, item)
                 if (localIdx >= 0) {
-                    merged[localIdx] = merged[localIdx].copy(serverId = item.serverId, failed = false)
+                    val local = merged[localIdx]
+                    if (local.failed && local.role == "user" && retryable?.trim() == local.content.trim()) {
+                        retryable = null
+                    }
+                    merged[localIdx] = local.copy(serverId = item.serverId, failed = false)
                     recognized += index
                 }
             }
@@ -233,6 +265,7 @@ class ChatStore {
             added = inserted
             current.copy(
                 messages = merged,
+                retryable = retryable,
                 lastServerMessageId = bumpCursor(current.lastServerMessageId, items),
             )
         }
@@ -241,7 +274,7 @@ class ChatStore {
 
     /**
      * Локальный двойник серверной строки: тот же `role` и текст, ещё без серверного id, не
-     * стримится.
+     * стримится, и строка могла появиться на сервере после него ([canBeEcho]).
      *
      * Сравнение по ПОДРЕЗАННОМУ тексту: сервер хранит ответ без крайних пробелов, а в потоке
      * они приходят (первым чанком часто идёт перевод строки). Точное равенство роняло слияние
@@ -250,8 +283,34 @@ class ChatStore {
     private fun indexOfLocalTwin(messages: List<ChatMessage>, item: ChatMessage): Int =
         messages.indexOfLast {
             it.serverId == null && !it.streaming && it.role == item.role &&
-                it.content.trim() == item.content.trim()
+                it.content.trim() == item.content.trim() && canBeEcho(it, item)
         }
+
+    /**
+     * Может ли серверная строка быть эхом локальной. Старая строка с тем же текстом эхом не
+     * бывает никогда. Паритет с iOS.
+     *
+     * Курсор на момент появления известен (> 0) — эхо только новее него по серверному id. Не
+     * известен (история ещё не пришла, либо тред пуст) — сравниваем время: серверный
+     * `createdAt` не раньше локального минус [ECHO_CLOCK_TOLERANCE_MS] (часы устройства могут
+     * спешить).
+     */
+    private fun canBeEcho(local: ChatMessage, item: ChatMessage): Boolean {
+        val floor = echoFloors[local.id] ?: 0L
+        return if (floor > 0L) {
+            (item.serverId ?: return false) > floor
+        } else {
+            item.timestamp >= local.timestamp - ECHO_CLOCK_TOLERANCE_MS
+        }
+    }
+
+    /**
+     * Серверная строка, которой может быть подтверждена отправка [localId]: курсор на момент
+     * отправки известен — новее него, иначе — любая. Для сверки после обрыва: ответ, записанный
+     * до отправки, доставкой не считается.
+     */
+    internal fun isAfterSend(localId: String, serverId: Long): Boolean =
+        serverId > (echoFloors[localId] ?: 0L)
 
     /**
      * Место новой серверной строки — сразу после последней строки ленты, которая раньше неё.
@@ -277,11 +336,20 @@ class ChatStore {
 
     fun resetForLogout() {
         _state.value = ChatState()
+        echoFloors.clear()
     }
 
     /**
      * Сменился пользователь: лента, режим, черновик и курсор принадлежат прежнему и уходят.
      * Приветствие — настройка хоста, а не переписка, поэтому остаётся.
      */
-    internal fun resetForIdentityChange() = _state.update { ChatState(greeting = it.greeting) }
+    internal fun resetForIdentityChange() {
+        _state.update { ChatState(greeting = it.greeting) }
+        echoFloors.clear()
+    }
+
+    private companion object {
+        /** Допуск на расхождение часов устройства и сервера при сверке эха по времени (как iOS). */
+        const val ECHO_CLOCK_TOLERANCE_MS = 5 * 60 * 1000L
+    }
 }

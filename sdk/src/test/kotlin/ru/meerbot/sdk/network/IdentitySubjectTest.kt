@@ -9,7 +9,8 @@ import org.junit.Test
 /**
  * Решение «что значит этот identify». Хост выпускает свежий токен на каждый вход в чат
  * (токены живут минуты), поэтому лента обязана сбрасываться только при смене человека, а не
- * при смене строки токена — иначе она мигала бы и обрывала стримящийся ответ.
+ * при смене строки токена — иначе она мигала бы и обрывала стримящийся ответ. Но «тот же
+ * человек» — только когда это известно: иначе новый человек мог бы увидеть тред прежнего.
  */
 class IdentitySubjectTest {
 
@@ -70,26 +71,39 @@ class IdentitySubjectTest {
         val first = hashOf(Jwt.withSub("user-42", iat = 1))
         val refreshed = hashOf(Jwt.withSub("user-42", iat = 2))
 
-        assertEquals(IdentityChange.Refresh, IdentitySubject.change(first, refreshed))
+        assertEquals(IdentityChange.Refresh, IdentitySubject.change(first, refreshed, newSubjectReadable = true))
     }
 
     @Test
     fun `токен другого пользователя без выхода — смена`() {
         assertEquals(
             IdentityChange.Switch,
-            IdentitySubject.change(hashOf(Jwt.withSub("user-42")), hashOf(Jwt.withSub("user-7"))),
+            IdentitySubject.change(hashOf(Jwt.withSub("user-42")), hashOf(Jwt.withSub("user-7")), newSubjectReadable = true),
         )
     }
 
+    /**
+     * Прежний хеш неизвестен: вход был на 0.2.8 (хеша тогда не было), хеш не прочитался, либо
+     * это действительно первый вход. Устройство могло остаться за человеком, которого SDK не
+     * знает, — без выхода новый увидел бы его тред, если сервер отклонит токен.
+     */
     @Test
-    fun `первый токен после анонима — вход`() {
-        assertEquals(IdentityChange.SignIn, IdentitySubject.change(null, hashOf(Jwt.withSub("user-7"))))
+    fun `прежний хеш неизвестен — выход и вход`() {
+        assertEquals(IdentityChange.Switch, IdentitySubject.change(null, hashOf(Jwt.withSub("user-7")), newSubjectReadable = true))
+    }
+
+    /** Нечитаемый `sub` — неизвестно, тот ли это человек, даже если строка токена та же. */
+    @Test
+    fun `нечитаемый sub нового токена — никогда не обновление`() {
+        val opaque = hashOf("opaque-token")
+
+        assertEquals(IdentityChange.Switch, IdentitySubject.change(opaque, opaque, newSubjectReadable = false))
     }
 
     @Test
     fun `выход — всегда выход`() {
-        assertEquals(IdentityChange.Logout, IdentitySubject.change(hashOf(Jwt.withSub("user-42")), null))
-        assertEquals(IdentityChange.Logout, IdentitySubject.change(null, null))
+        assertEquals(IdentityChange.Logout, IdentitySubject.change(hashOf(Jwt.withSub("user-42")), null, newSubjectReadable = false))
+        assertEquals(IdentityChange.Logout, IdentitySubject.change(null, null, newSubjectReadable = false))
     }
 
     @Test

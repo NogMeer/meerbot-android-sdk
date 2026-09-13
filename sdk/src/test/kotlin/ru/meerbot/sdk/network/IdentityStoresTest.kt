@@ -64,6 +64,38 @@ class IdentityStoresTest {
         assertTrue(flag.pending)
     }
 
+    /**
+     * `identify(null)` с фонового потока: процесс могут убить до того, как главный поток
+     * применит выход, и отложенная запись `apply()` не успеет лечь на диск.
+     */
+    @Test
+    fun `выход пишется на диск синхронно`() {
+        PrefsLogoutFlagStore(prefs, reporter).persistPending()
+
+        assertEquals(1, prefs.commits)
+        assertEquals(0, prefs.applies)
+        assertEquals(true, prefs.values[PrefsLogoutFlagStore.KEY])
+    }
+
+    @Test
+    fun `обычная запись флага — отложенная`() {
+        PrefsLogoutFlagStore(prefs, reporter).pending = true
+
+        assertEquals(0, prefs.commits)
+        assertEquals(1, prefs.applies)
+    }
+
+    @Test
+    fun `незаписанный синхронный выход остаётся в памяти и назван в логе`() {
+        prefs.failWrites = true
+        val store = PrefsLogoutFlagStore(prefs, reporter)
+
+        store.persistPending()
+
+        assertTrue(store.pending)
+        assertEquals(listOf("logout_flag_write_failed"), errors)
+    }
+
     @Test
     fun `хеш субъекта пишется, читается и стирается`() {
         PrefsSubjectHashStore(prefs, reporter).hash = "abc"

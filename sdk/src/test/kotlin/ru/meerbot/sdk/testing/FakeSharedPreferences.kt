@@ -17,6 +17,13 @@ class FakeSharedPreferences : SharedPreferences {
     @Volatile
     var failWrites = false
 
+    /** Синхронные записи (`commit()`) и отложенные (`apply()`) — чтобы отличать одну от другой. */
+    @Volatile
+    var commits = 0
+
+    @Volatile
+    var applies = 0
+
     private fun <T> read(block: () -> T): T {
         if (failReads) throw SecurityException("Could not decrypt value")
         return synchronized(values) { block() }
@@ -59,16 +66,22 @@ class FakeSharedPreferences : SharedPreferences {
         override fun clear(): SharedPreferences.Editor = apply { clear = true }
 
         override fun commit(): Boolean {
+            commits++
+            return write()
+        }
+
+        override fun apply() {
+            applies++
+            write()
+        }
+
+        private fun write(): Boolean {
             synchronized(values) {
                 if (clear) values.clear()
                 removals.forEach { values.remove(it) }
                 values.putAll(changes)
             }
             return true
-        }
-
-        override fun apply() {
-            commit()
         }
     }
 }

@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
 import androidx.annotation.MainThread
+import androidx.annotation.VisibleForTesting
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -15,6 +16,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import okhttp3.OkHttpClient
 import ru.meerbot.sdk.internal.EarlyLogout
+import ru.meerbot.sdk.internal.EarlyLogoutFile
 import ru.meerbot.sdk.internal.MainThreadSerialExecutor
 import ru.meerbot.sdk.network.ApiClient
 import ru.meerbot.sdk.network.IdentityCoordinator
@@ -59,13 +61,25 @@ object MeerBot {
     private const val KEY_INSTALLATION_ID = "installation_id"
     private const val TAG = "MeerBot"
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    // Лениво: `Dispatchers.Main` требует главного Looper, а синглтон создаётся и в JVM-тестах.
+    private val scope by lazy { CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate) }
 
-    /** Все изменения состояния SDK — через него (см. [MainThreadSerialExecutor]). */
-    private val mainThread by lazy { MainThreadSerialExecutor.forMainLooper() }
+    private val mainLooperExecutor by lazy { MainThreadSerialExecutor.forMainLooper() }
+
+    /**
+     * Очередь вместо главного Looper — только для JVM-тестов: так проверяется, что публичные
+     * методы действительно идут через очередь, а не меняют состояние на потоке вызывающего.
+     */
+    @VisibleForTesting
+    @Volatile
+    internal var executorOverride: MainThreadSerialExecutor? = null
+
+    /** Все изменения состояния SDK — через неё (см. [MainThreadSerialExecutor]). */
+    private val mainThread: MainThreadSerialExecutor
+        get() = executorOverride ?: mainLooperExecutor
 
     // Пишутся только на главном потоке; @Volatile — для чтения с любого (`identityStatus()`,
-    // `chatController()`, `handlePush`).
+    // `chatController()`, `handlePush`, запись выхода в `identify`).
     @Volatile
     private var prefs: SharedPreferences? = null
 
@@ -91,10 +105,32 @@ object MeerBot {
 
     /**
      * Выход, запрошенный до configure() в этом процессе. Дублирует диск ([EarlyLogout]): если
-     * хост вырезал провайдер контекста, в этом процессе сигнал всё равно не потеряется.
+     * контекста приложения до настройки нет, в этом процессе сигнал всё равно не потеряется.
      */
     @Volatile
     private var pendingLogout = false
+
+    /** Отметки раннего выхода, записанные этим процессом до настройки. Только главный поток. */
+    private val pendingEarlyMarks = ArrayList<EarlyLogoutFile.Mark>()
+
+    /**
+     * Отметки раннего выхода, уже применённые в этом процессе. Только главный поток: повторный
+     * `configure`, прочитавший отметку до того, как первый её снял, не повторит выход поверх
+     * пользователя, вошедшего между ними.
+     */
+    private val appliedEarlyMarkers = HashSet<String>()
+
+    /** Как записан выход на потоке вызывающего `identify(null)`. */
+    private sealed interface LogoutIntent {
+        /** Флаг клиента на диске (SDK был настроен). */
+        object InClient : LogoutIntent
+
+        /** Отметка раннего выхода на диске (SDK не был настроен). */
+        class Early(val mark: EarlyLogoutFile.Mark) : LogoutIntent
+
+        /** Записать некуда: нет ни клиента, ни контекста приложения. */
+        object NotPersisted : LogoutIntent
+    }
 
     /**
      * Настроить SDK.
@@ -127,9 +163,11 @@ object MeerBot {
     ) {
         val appContext = context.applicationContext
         val store = openPrefs(appContext)
-        // Провайдер уже дал контекст при старте процесса; здесь — для хоста, вырезавшего его.
+        // Инициализатор уже дал контекст при старте процесса; здесь — для хоста, отключившего его.
         EarlyLogout.attach(appContext)
-        mainThread.execute { applyConfiguration(store, configuration, httpClient) }
+        // Выход до настройки — из прошлого запуска или другого процесса. Читается здесь, с диска.
+        val earlyMarker = EarlyLogout.file.read()
+        mainThread.execute { applyConfiguration(store, configuration, httpClient, earlyMarker) }
     }
 
     @MainThread
@@ -137,6 +175,7 @@ object MeerBot {
         store: SharedPreferences,
         configuration: MeerBotConfiguration,
         httpClient: OkHttpClient,
+        earlyMarker: String?,
     ) {
         prefs = store
         val uuid = getOrCreate(store, KEY_VISITOR_UUID) { UUID.randomUUID().toString() }
@@ -167,10 +206,22 @@ object MeerBot {
         // Выход до configure — в этом процессе или в прошлом — применяется раньше токена:
         // `identify(null)`, затем `identify(B)` до настройки дают одно рукопожатие с `logout`
         // и токеном B, как и после неё.
-        if (pendingLogout || EarlyLogout.isPending()) {
+        val early = earlyMarker?.takeUnless { it in appliedEarlyMarkers }
+        if (pendingLogout || early != null) {
+            // Флаг клиента — на диск синхронно ДО снятия ранней отметки: процесс, убитый между
+            // ними, иначе забыл бы выход. Запись редкая — только когда выход до настройки был.
+            apiClient.persistLogoutIntent()
             coordinator.apply(null)
             pendingLogout = false
-            EarlyLogout.clear()
+            early?.let {
+                appliedEarlyMarkers += it
+                EarlyLogout.file.clear(it)
+            }
+            pendingEarlyMarks.forEach {
+                appliedEarlyMarkers += it.marker
+                EarlyLogout.file.clear(it.marker)
+            }
+            pendingEarlyMarks.clear()
         }
         pendingIdentityToken?.let { token ->
             pendingIdentityToken = null
@@ -229,17 +280,16 @@ object MeerBot {
      * Мобильные приложения). Пока он не передан, посетитель анонимен: инструменты с доступом
      * к данным клиента ему недоступны.
      *
-     * Что делает вызов, решает `sub` токена (у нечитаемого токена — вся строка) в сравнении с
-     * последним применённым на этой установке. SDK хранит его хеш, поэтому сравнение переживает
-     * перезапуск приложения:
-     * - **тот же пользователь** (свежий токен на очередной вход в чат) — токен уходит в
-     *   следующее рукопожатие, лента не трогается;
-     * - **первый вход** (токена не было или был выход) — токен уходит в рукопожатие, лента
-     *   очищается;
-     * - **другой пользователь без выхода прежнего** — это выход плюс вход: следующее
-     *   рукопожатие несёт `logout: true` и новый токен, диалог, курсор и статус identity
-     *   прежнего сбрасываются, лента очищается. Новый человек не увидит тред прежнего, даже
-     *   если его токен сервер не примет (например, просрочен);
+     * Что делает вызов, решает `sub` токена в сравнении с последним применённым на этой
+     * установке. SDK хранит его хеш, поэтому сравнение переживает перезапуск приложения:
+     * - **тот же пользователь** (`sub` читается и совпал; свежий токен на очередной вход в чат) —
+     *   токен уходит в следующее рукопожатие, лента не трогается;
+     * - **любой другой токен** — другой `sub`, первый вход, вход после выхода, прежний `sub`
+     *   неизвестен (вход был на SDK 0.2.8 и старше) или `sub` нового не читается — это выход
+     *   плюс вход: следующее рукопожатие несёт `logout: true` и новый токен, диалог, курсор и
+     *   статус identity прежнего сбрасываются, лента очищается. Новый человек не увидит тред
+     *   прежнего, даже если его токен сервер не примет (просрочен, исчерпан лимит). Тот же
+     *   человек, вошедший заново, тред не теряет: сервер сохраняет связь для того же `sub`;
      * - **`null`** — НАСТОЯЩИЙ выход пользователя из аккаунта, и звать его нужно только тогда,
      *   а не «на всякий случай» при пустом токене. С 0.2.9 выход отвязывает устройство на
      *   сервере при следующем подключении: прежний тред остаётся за прежним пользователем,
@@ -252,31 +302,69 @@ object MeerBot {
      * `identify(B)` с фонового потока придут именно так. С фонового потока действие
      * асинхронно — к возврату из метода оно может быть ещё не применено.
      *
-     * До `configure(...)` вызов запоминается и применяется при настройке. Выход к тому же сразу
-     * пишется на диск (контекст приложения SDK получает при старте процесса своим
-     * ContentProvider) и переживает перезапуск, даже если `configure` в этом процессе так и не
-     * позовут. Если хост вырезал провайдер из манифеста, выход до `configure` живёт только в
-     * памяти процесса.
+     * Выход пишется на диск синхронно, ещё на потоке вызывающего (одна короткая запись на
+     * выход), и переживает убийство процесса сразу после вызова. До `configure(...)` вызов
+     * запоминается и применяется при настройке; выход и тогда на диске (контекст приложения SDK
+     * получает при старте процесса через `androidx.startup`) и переживает перезапуск, даже если
+     * `configure` в этом процессе так и не позовут. Если хост отключил инициализатор SDK, выход
+     * до `configure` живёт только в памяти процесса.
      */
     fun identify(token: String?) {
-        mainThread.execute { applyIdentity(token) }
+        val intent = if (token == null) persistLogoutIntent() else null
+        mainThread.execute { applyIdentity(token, intent) }
+    }
+
+    /**
+     * Выход — на диск на потоке вызывающего, ДО постановки в очередь: вызов с фонового потока
+     * иначе ложился бы на диск только после прохода очереди главного потока (и `apply()`), и
+     * процесс, убитый в этом окне, забыл бы выход.
+     */
+    private fun persistLogoutIntent(): LogoutIntent {
+        client?.let {
+            it.persistLogoutIntent()
+            return LogoutIntent.InClient
+        }
+        val mark = EarlyLogout.file.mark() ?: return LogoutIntent.NotPersisted
+        return LogoutIntent.Early(mark)
     }
 
     @MainThread
-    private fun applyIdentity(token: String?) {
+    private fun applyIdentity(token: String?, intent: LogoutIntent?) {
         val coordinator = identity
         if (coordinator == null) {
             if (token == null) {
                 pendingLogout = true
-                if (!EarlyLogout.markPending()) {
+                // Отметку могла снять `reset()`, прошедшая в очереди раньше, либо на момент
+                // вызова SDK был настроен и выход лёг во флаг клиента, которого уже нет.
+                val mark = (intent as? LogoutIntent.Early)?.mark?.takeIf { EarlyLogout.file.isIntact(it) }
+                    ?: EarlyLogout.file.mark()
+                if (mark != null) {
+                    pendingEarlyMarks += mark
+                } else {
                     Log.w(TAG, "logout_not_persisted: выход до configure() без контекста приложения останется только в памяти процесса")
                 }
             }
             pendingIdentityToken = token
             return
         }
-        coordinator.apply(token)
+        if (token != null) {
+            coordinator.apply(token)
+            return
+        }
+        // Настройка применилась между вызовом и этой строкой: выход лёг ранней отметкой (или
+        // никуда). Флаг клиента — на диск синхронно, и только затем отметка снимается.
+        if (intent !is LogoutIntent.InClient) client?.persistLogoutIntent()
+        coordinator.apply(null)
+        (intent as? LogoutIntent.Early)?.let {
+            appliedEarlyMarkers += it.mark.marker
+            EarlyLogout.file.clear(it.mark.marker)
+        }
     }
+
+    /** Токен, ждущий настройки, — для JVM-тестов порядка вызовов. */
+    @VisibleForTesting
+    internal val pendingIdentityTokenForTests: String?
+        get() = pendingIdentityToken
 
     /** Что сервер сделал с identity на последнем рукопожатии. */
     fun identityStatus(): IdentityStatus = client?.identityStatus ?: IdentityStatus.NotProvided
@@ -339,8 +427,9 @@ object MeerBot {
         visitorUuid = null
         pendingIdentityToken = null
         pendingLogout = false
+        pendingEarlyMarks.clear()
         prefs?.edit()?.clear()?.apply()
-        EarlyLogout.clear()
+        EarlyLogout.file.clearAll()
     }
 
     // ─── Внутреннее ───────────────────────────────────────────────────────────────────────

@@ -4,10 +4,12 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.job
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.SocketPolicy
@@ -24,7 +26,23 @@ import ru.meerbot.sdk.R
 import ru.meerbot.sdk.network.ApiClient
 import ru.meerbot.sdk.network.MeerBotConfiguration
 import ru.meerbot.sdk.testing.ScriptedDispatcher
-import java.util.concurrent.TimeUnit
+import java.time.Instant
+
+/** Дождаться состояния подпиской на StateFlow, а не опросом с паузами. */
+private fun awaitState(controller: ChatController, timeoutMs: Long, check: (ChatState) -> Boolean) {
+    val reached = runBlocking { withTimeoutOrNull(timeoutMs) { controller.state.first(check) } }
+    if (reached == null) fail("состояние не дождалось условия: ${controller.state.value}")
+}
+
+/** Все задачи scope доработали: отменённые — дошли до конца, новых запросов быть не может. */
+private fun awaitIdle(scope: CoroutineScope) = runBlocking {
+    withTimeout(5_000) { scope.coroutineContext.job.children.toList().joinAll() }
+}
+
+/** ISO-8601 `createdAt` сервера. Эхо сверяется со временем отправки, поэтому «сейчас» — настоящее. */
+private fun iso(ms: Long = System.currentTimeMillis()): String = Instant.ofEpochMilli(ms).toString()
+
+private const val DAY_MS = 24 * 60 * 60 * 1000L
 
 /**
  * Поведение на границе сети: что видит пользователь при обрыве, повторе, приходе истории.
@@ -80,6 +98,17 @@ class ChatControllerTest {
         .setHeader("Content-Type", "text/event-stream")
         .setBody(body)
 
+    private val metaFrame = "event: meta\ndata: {\"conversationId\":3,\"mode\":\"ai\"}\n\n"
+
+    /**
+     * Поток, оборванный посреди тела. MockWebServer отдаёт половину тела и рвёт соединение,
+     * поэтому после значимых кадров идёт заполнитель: они гарантированно в первой половине.
+     */
+    private fun brokenStream(frames: String) = sse(
+        frames + "data: {\"choices\":[{\"delta\":{\"content\":\"нача\"}}]}\n\n" +
+            "event: heartbeat\ndata: {}\n\n".repeat(40),
+    ).setSocketPolicy(SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY)
+
     /** Стартовать и дождаться готовности: рукопожатие + пустая история. */
     private fun started(
         mode: String = "ai",
@@ -94,19 +123,11 @@ class ChatControllerTest {
         return controller
     }
 
-    private fun await(controller: ChatController, timeoutMs: Long = 5_000, check: (ChatState) -> Boolean) {
-        val deadline = System.currentTimeMillis() + timeoutMs
-        while (System.currentTimeMillis() < deadline) {
-            if (check(controller.state.value)) return
-            Thread.sleep(20)
-        }
-        fail("состояние не дождалось условия: ${controller.state.value}")
-    }
+    private fun await(controller: ChatController, timeoutMs: Long = 5_000, check: (ChatState) -> Boolean) =
+        awaitState(controller, timeoutMs, check)
 
     /** Дождаться, пока доработают все задачи контроллера, — вместо паузы наугад. */
-    private fun awaitControllerIdle() = runBlocking {
-        withTimeout(5_000) { scope.coroutineContext.job.children.toList().joinAll() }
-    }
+    private fun awaitControllerIdle() = awaitIdle(scope)
 
     @Test
     fun `старт поднимает сессию и подтягивает прошлую переписку`() {
@@ -156,7 +177,7 @@ class ChatControllerTest {
         val controller = started()
         server.enqueue(
             sse(
-                "event: meta\ndata: {\"conversationId\":3,\"mode\":\"ai\"}\n\n" +
+                metaFrame +
                     "data: {\"choices\":[{\"delta\":{\"content\":\"Здрав\"}}]}\n\n" +
                     "data: {\"choices\":[{\"delta\":{\"content\":\"ствуйте\"}}]}\n\n" +
                     "data: [DONE]\n\n"
@@ -182,22 +203,37 @@ class ChatControllerTest {
             sse("data: {\"choices\":[{\"delta\":{\"content\":\"нача\"}}]}\n\n")
                 .setSocketPolicy(SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY)
         )
-        // Серверная лента не заканчивается ответом — значит, ответа не было, и сообщение
-        // пользователя честно помечается недоставленным.
-        server.enqueue(history())
 
         controller.send("привет")
 
         // Ждём именно `retryable`, а не баннер ошибки: `handleFailure` ставит ошибку СРАЗУ,
-        // а пометку недоставленного и текст для повтора — только после запроса ленты
-        // (вдруг сервер ответ всё-таки дописал). Между ними целый сетевой круг, и ожидание
-        // по баннеру ловило состояние до его закрытия — тест мигал.
+        // а пометку недоставленного и текст для повтора — только после сверки с сервером.
         await(controller) { it.retryable != null }
         val state = controller.state.value
         assertEquals("привет", state.retryable)
         assertNotNull(state.connectionError)
         assertTrue(state.messages.first { it.role == "user" }.failed)
         assertTrue(!state.sending)
+    }
+
+    /**
+     * Сервер не прислал `meta` — диалог не открыт, сообщение до него не дошло. Запрос истории
+     * здесь ничего не решил бы (паритет с iOS).
+     */
+    @Test
+    fun `обрыв до открытия диалога историю не запрашивает`() {
+        val dispatcher = ScriptedDispatcher().also { server.dispatcher = it }
+        val controller = controller()
+        controller.start()
+        await(controller) { it.ready }
+        dispatcher.clearArrivals()
+        dispatcher.streamFallback = { ScriptedDispatcher.error(502, "bad_gateway") }
+
+        controller.send("привет")
+
+        await(controller) { it.retryable != null }
+        assertEquals(0, dispatcher.historyArrivalCount())
+        assertTrue(controller.state.value.messages.single().failed)
     }
 
     @Test
@@ -207,7 +243,6 @@ class ChatControllerTest {
             sse("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n")
                 .setSocketPolicy(SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY)
         )
-        server.enqueue(history())
         server.enqueue(sse("data: {\"choices\":[{\"delta\":{\"content\":\"готово\"}}]}\n\ndata: [DONE]\n\n"))
         controller.send("привет")
         await(controller) { it.retryable != null }
@@ -225,15 +260,12 @@ class ChatControllerTest {
     @Test
     fun `серверная история заменяет ленту после обрыва`() {
         val controller = started()
-        server.enqueue(
-            sse("data: {\"choices\":[{\"delta\":{\"content\":\"нача\"}}]}\n\n")
-                .setSocketPolicy(SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY)
-        )
+        server.enqueue(brokenStream(metaFrame))
         // Сервер успел дописать ответ, пока рвалось соединение.
         server.enqueue(
             history(
-                messages = """{"id":1,"role":"user","content":"привет","createdAt":"2026-08-14T10:00:00.000Z"},
-                   {"id":2,"role":"assistant","content":"ответ дописан","createdAt":"2026-08-14T10:00:02.000Z"}"""
+                messages = """{"id":1,"role":"user","content":"привет","createdAt":"${iso()}"},
+                   {"id":2,"role":"assistant","content":"ответ дописан","createdAt":"${iso()}"}"""
             )
         )
 
@@ -286,15 +318,16 @@ class ChatControllerTest {
         assertEquals("ai", controller.state.value.messages.single().author)
     }
 
+    /** Отказ в закрытом диалоге синхронный: ни сообщения, ни задачи, ни запроса. */
     @Test
     fun `в закрытом диалоге отправка не уходит`() {
         val controller = started(mode = "closed")
 
         controller.send("привет")
-        Thread.sleep(200)
 
         assertEquals(ChatMode.Closed, controller.state.value.mode)
         assertTrue(controller.state.value.messages.isEmpty())
+        assertTrue(!controller.state.value.sending)
         assertEquals(2, server.requestCount)
     }
 
@@ -409,9 +442,12 @@ class ChatControllerTest {
     }
 
     /**
-     * Хост сменил токен дважды, пока шла отправка, а эпоха контроллера та же (смены человека
-     * не было): рукопожатие исчерпало попытки. Сообщение не ушло — пользователь обязан это
-     * увидеть и повторить, а не потерять его молча.
+     * Хост сменил токен дважды через публичный `ApiClient.setIdentityToken`, пока шла отправка:
+     * поколение клиента сменилось, а эпоха контроллера — нет (её двигает только
+     * `MeerBot.identify` через сброс ленты). Рукопожатие исчерпало попытки. Сообщение не ушло —
+     * пользователь обязан это увидеть и повторить, а не потерять его молча. Через `MeerBot`
+     * этот путь недостижим: там каждая смена identity, кроме свежего токена того же человека,
+     * двигает и эпоху.
      */
     @Test
     fun `исчерпанное рукопожатие без смены пользователя помечает сообщение недоставленным`() {
@@ -437,6 +473,7 @@ class ChatControllerTest {
         val state = controller.state.value
         assertEquals("привет", state.retryable)
         assertEquals("cancelled", state.connectionError?.code)
+        assertEquals(R.string.meerbot_err_cancelled, state.connectionError?.messageRes)
         assertTrue(state.messages.single { it.role == "user" }.failed)
         assertTrue(!state.sending)
     }
@@ -449,9 +486,9 @@ class ChatControllerTest {
            {"id":6,"role":"assistant","content":"старый ответ","createdAt":"2026-08-14T10:00:01.000Z"}"""
 
     /** Догон после отправки: сервер отдаёт то же сообщение и ответ уже со своими id. */
-    private val echoPage =
-        """{"id":7,"role":"user","content":"привет","createdAt":"2026-09-13T10:00:00.000Z"},
-           {"id":8,"role":"assistant","content":"Здравствуйте","createdAt":"2026-09-13T10:00:01.000Z"}"""
+    private fun echoPage() =
+        """{"id":7,"role":"user","content":"привет","createdAt":"${iso()}"},
+           {"id":8,"role":"assistant","content":"Здравствуйте","createdAt":"${iso()}"}"""
 
     private val answerStream =
         "data: {\"choices\":[{\"delta\":{\"content\":\"Здравствуйте\"}}]}\n\ndata: [DONE]\n\n"
@@ -482,7 +519,7 @@ class ChatControllerTest {
         assertNull(local.serverId)
         assertTrue(applied.messages[3].streaming)
 
-        dispatcher.historyFallback = { ScriptedDispatcher.history(messages = echoPage) }
+        dispatcher.historyFallback = { ScriptedDispatcher.history(messages = echoPage()) }
         streamGate.countDown()
         await(controller) { s -> !s.sending && s.messages.any { it.serverId == 8L } }
 
@@ -515,7 +552,7 @@ class ChatControllerTest {
         assertEquals("привет", applied.retryable)
 
         dispatcher.streamFallback = { ScriptedDispatcher.sse(answerStream) }
-        dispatcher.historyFallback = { ScriptedDispatcher.history(messages = echoPage) }
+        dispatcher.historyFallback = { ScriptedDispatcher.history(messages = echoPage()) }
         controller.retry()
         await(controller) { s -> !s.sending && s.messages.any { it.serverId == 8L } }
 
@@ -532,7 +569,7 @@ class ChatControllerTest {
     @Test
     fun `эхо сообщения в стартовой истории не двоит его`() {
         val dispatcher = ScriptedDispatcher().also { server.dispatcher = it }
-        val echoOnly = """{"id":7,"role":"user","content":"привет","createdAt":"2026-09-13T10:00:00.000Z"}"""
+        val echoOnly = """{"id":7,"role":"user","content":"привет","createdAt":"${iso()}"}"""
         val historyGate = dispatcher.gateNextHistory(ScriptedDispatcher.history(messages = "$earlierThread, $echoOnly"))
         val streamGate = dispatcher.gateNextStream(ScriptedDispatcher.sse(answerStream))
         val controller = controller()
@@ -551,13 +588,84 @@ class ChatControllerTest {
         assertEquals(7L, applied.messages[2].serverId)
         assertTrue(applied.messages[3].streaming)
 
-        dispatcher.historyFallback = { ScriptedDispatcher.history(messages = echoPage) }
+        dispatcher.historyFallback = { ScriptedDispatcher.history(messages = echoPage()) }
         streamGate.countDown()
         await(controller) { s -> !s.sending && s.messages.any { it.serverId == 8L } }
 
         val state = controller.state.value
         assertEquals(listOf(5L, 6L, 7L, 8L), state.messages.map { it.serverId })
         assertEquals(localId, state.messages[2].id)
+    }
+
+    /** Вчерашний тред с тем же текстом, что отправляется сейчас. */
+    private fun yesterdayThread() =
+        """{"id":5,"role":"user","content":"да","createdAt":"${iso(System.currentTimeMillis() - DAY_MS)}"},
+           {"id":6,"role":"assistant","content":"Хорошо","createdAt":"${iso(System.currentTimeMillis() - DAY_MS + 1_000)}"}"""
+
+    /**
+     * «Да» отправлено до прихода стартовой истории, в истории — вчерашнее «да» с ответом. До
+     * правки вчерашняя строка забирала новое сообщение (и сама пропадала из ленты), а настоящее
+     * эхо после ответа вставало вторым «да».
+     */
+    @Test
+    fun `вчерашнее сообщение с тем же текстом — не эхо`() {
+        val dispatcher = ScriptedDispatcher().also { server.dispatcher = it }
+        val historyGate = dispatcher.gateNextHistory(ScriptedDispatcher.history(messages = yesterdayThread()))
+        val streamGate = dispatcher.gateNextStream(
+            ScriptedDispatcher.sse("data: {\"choices\":[{\"delta\":{\"content\":\"Отлично\"}}]}\n\ndata: [DONE]\n\n"),
+        )
+        val controller = controller()
+
+        controller.start()
+        dispatcher.awaitHistory()
+        controller.send("да")
+        dispatcher.awaitStream()
+        historyGate.countDown()
+        await(controller) { it.ready }
+
+        val applied = controller.state.value
+        assertEquals(listOf("да", "Хорошо", "да", ""), applied.messages.map { it.content })
+        assertEquals(listOf(5L, 6L, null, null), applied.messages.map { it.serverId })
+        val localId = applied.messages[2].id
+
+        val echo = """{"id":40,"role":"user","content":"да","createdAt":"${iso()}"},
+                      {"id":41,"role":"assistant","content":"Отлично","createdAt":"${iso()}"}"""
+        dispatcher.historyFallback = { ScriptedDispatcher.history(messages = "${yesterdayThread()}, $echo") }
+        streamGate.countDown()
+        await(controller) { s -> !s.sending && s.messages.any { it.serverId == 41L } }
+
+        val state = controller.state.value
+        assertEquals(listOf("да", "Хорошо", "да", "Отлично"), state.messages.map { it.content })
+        assertEquals(listOf(5L, 6L, 40L, 41L), state.messages.map { it.serverId })
+        assertEquals(localId, state.messages[2].id)
+    }
+
+    /**
+     * Обрыв после открытия диалога, сообщение до сервера не дошло. История приносит вчерашнее
+     * «да» и ответ после него — до правки это засчитывалось доставкой по id вчерашней строки:
+     * «Повторить» не появлялся, и сообщение терялось молча.
+     */
+    @Test
+    fun `обрыв со вчерашним сообщением того же текста оставляет «Повторить»`() {
+        val dispatcher = ScriptedDispatcher().also { server.dispatcher = it }
+        val historyGate = dispatcher.gateNextHistory(ScriptedDispatcher.history(messages = yesterdayThread()))
+        dispatcher.historyFallback = { ScriptedDispatcher.history(messages = yesterdayThread()) }
+        dispatcher.streamFallback = { brokenStream(metaFrame) }
+        val controller = controller()
+
+        controller.start()
+        dispatcher.awaitHistory()
+        controller.send("да")
+        await(controller) { it.retryable != null }
+        historyGate.countDown()
+        await(controller) { it.ready }
+
+        val state = controller.state.value
+        assertEquals("да", state.retryable)
+        // Частично полученный ответ («нача») не выбрасывается — он остаётся под сообщением.
+        assertEquals(listOf("да", "Хорошо", "да", "нача"), state.messages.map { it.content })
+        assertEquals(listOf(5L, 6L, null, null), state.messages.map { it.serverId })
+        assertTrue(state.messages[2].failed)
     }
 
     /**
@@ -567,7 +675,10 @@ class ChatControllerTest {
      */
     @Test
     fun `обрыв до записи сообщения не принимается за доставку`() {
-        val controller = started()
+        val api = apiClient()
+        val controller = started(client = api)
+        // Диалог уже открыт прошлым потоком — иначе история после обрыва не запрашивается.
+        api.rememberConversationId(3)
         // Отказ шлюза, а не обрыв сокета: обрыв сразу после запроса OkHttp молча повторяет,
         // и повтор забрал бы из очереди следующий ответ — историю — как тело потока.
         server.enqueue(ScriptedDispatcher.error(502, "bad_gateway"))
@@ -592,7 +703,7 @@ class ChatControllerTest {
         val controller = controller()
         controller.start()
         await(controller) { it.ready }
-        dispatcher.historyFallback = { ScriptedDispatcher.history(messages = echoPage) }
+        dispatcher.historyFallback = { ScriptedDispatcher.history(messages = echoPage()) }
         dispatcher.streamFallback = {
             ScriptedDispatcher.sse(
                 "data: {\"choices\":[{\"delta\":{\"content\":\"Здрав\"}}]}\n\n" +
@@ -647,7 +758,9 @@ class ChatControllerTest {
  * живёт только на время ответа бота, а пуш зависит от бэкенда интегратора.
  *
  * Тесты ужимают периоды до миллисекунд: проверять шестисекундный тик ожиданием шести секунд
- * — верный способ получить мигающий набор в релизном скрипте.
+ * — верный способ получить мигающий набор в релизном скрипте. Паузы наугад не используются:
+ * догон последовательный, поэтому приход (N+1)-го запроса истории означает, что N-я страница
+ * уже влита.
  */
 class ChatControllerCatchUpTest {
 
@@ -695,18 +808,21 @@ class ChatControllerCatchUpTest {
     private fun managerMessage(id: Int, text: String) =
         """{"id":$id,"role":"assistant","content":"$text","authorKind":"manager","authorName":"Роман","createdAt":"2026-08-25T10:00:00.000Z"}"""
 
-    private fun await(controller: ChatController, timeoutMs: Long = 5_000, check: (ChatState) -> Boolean) {
-        val deadline = System.currentTimeMillis() + timeoutMs
-        while (System.currentTimeMillis() < deadline) {
-            if (check(controller.state.value)) return
-            Thread.sleep(10)
-        }
-        fail("состояние не дождалось условия: ${controller.state.value}")
-    }
+    private fun await(controller: ChatController, timeoutMs: Long = 5_000, check: (ChatState) -> Boolean) =
+        awaitState(controller, timeoutMs, check)
 
     private fun started(mode: String = "human"): ChatController {
         server.enqueue(register())
         server.enqueue(history(mode = mode))
+        val controller = controller()
+        controller.start()
+        await(controller) { it.ready }
+        return controller
+    }
+
+    /** Старт через диспетчер: ответы по пути, приходы запросов считаются. */
+    private fun startedScripted(dispatcher: ScriptedDispatcher): ChatController {
+        server.dispatcher = dispatcher
         val controller = controller()
         controller.start()
         await(controller) { it.ready }
@@ -742,11 +858,13 @@ class ChatControllerCatchUpTest {
 
     @Test
     fun `повторная страница не дублирует сообщение`() {
-        val controller = started()
-        repeat(3) { server.enqueue(history(mode = "human", messages = managerMessage(9, "я тут"))) }
+        val dispatcher = ScriptedDispatcher()
+        dispatcher.historyFallback = { ScriptedDispatcher.history(mode = "human", messages = managerMessage(9, "я тут")) }
+        val controller = startedScripted(dispatcher)
+        dispatcher.clearArrivals()
 
-        await(controller) { it.messages.size == 1 }
-        Thread.sleep(150)
+        // Четыре прихода после старта — не меньше трёх влитых повторов той же страницы.
+        repeat(4) { dispatcher.awaitHistory() }
 
         assertEquals(1, controller.state.value.messages.size)
     }
@@ -754,31 +872,35 @@ class ChatControllerCatchUpTest {
     /** Оборванная сеть у того, кто просто смотрит переписку, — не повод красить экран. */
     @Test
     fun `ошибка фонового догона не показывается пользователю`() {
-        val controller = started()
-        repeat(3) { server.enqueue(MockResponse().setResponseCode(500)) }
+        val dispatcher = ScriptedDispatcher()
+        val controller = startedScripted(dispatcher)
+        dispatcher.historyFallback = { ScriptedDispatcher.error(500, "internal") }
+        dispatcher.clearArrivals()
 
-        Thread.sleep(200)
+        repeat(3) { dispatcher.awaitHistory() }
 
         assertNull(controller.state.value.connectionError)
     }
 
     /**
-     * Гарантия здесь — «после stop() НОВЫЕ циклы догона не начинаются», а не «сеть замирает
-     * в ту же наносекунду». Запрос, отправленный до stop(), долетает, и снятая сразу после
-     * stop() отметка его не включала бы — тест мигал на CI. Поэтому отметка снимается после
-     * паузы, достаточной, чтобы всё уже отправленное дошло, а проверяется следующий интервал.
+     * Гарантия здесь — «после stop() НОВЫЕ циклы догона не начинаются», а не «сеть замирает в
+     * ту же наносекунду»: запрос, отправленный до stop(), долетает. Поэтому сначала все задачи
+     * доводятся до конца, и уже тогда проверяется, что живых задач — а значит и новых запросов —
+     * нет.
      */
     @Test
     fun `stop останавливает догон`() {
-        val controller = started()
-        repeat(5) { server.enqueue(history(mode = "human")) }
-        Thread.sleep(120)
+        val dispatcher = ScriptedDispatcher()
+        dispatcher.historyFallback = { ScriptedDispatcher.history(mode = "human") }
+        val controller = startedScripted(dispatcher)
+        dispatcher.clearArrivals()
+        repeat(2) { dispatcher.awaitHistory() }
 
         controller.stop()
-        Thread.sleep(150)
+        awaitIdle(scope)
         val afterStop = server.requestCount
-        Thread.sleep(200)
 
+        assertTrue(scope.coroutineContext.job.children.none { it.isActive })
         assertEquals(afterStop, server.requestCount)
     }
 
@@ -789,14 +911,12 @@ class ChatControllerCatchUpTest {
      */
     @Test
     fun `непризнанное после переподключения устройство останавливает фоновый догон`() {
-        val dispatcher = ScriptedDispatcher().also { server.dispatcher = it }
-        val controller = controller()
-        controller.start()
-        await(controller) { it.ready }
+        val dispatcher = ScriptedDispatcher()
+        val controller = startedScripted(dispatcher)
 
         dispatcher.historyFallback = { ScriptedDispatcher.error(401, "device_not_found") }
         await(controller) { it.connectionError?.code == "device_not_found" }
-        runBlocking { withTimeout(5_000) { scope.coroutineContext.job.children.toList().joinAll() } }
+        awaitIdle(scope)
 
         assertEquals(R.string.meerbot_err_session_lost, controller.state.value.connectionError?.messageRes)
 
@@ -806,16 +926,33 @@ class ChatControllerCatchUpTest {
         assertTrue(scope.coroutineContext.job.children.any { it.isActive })
     }
 
+    /** Возврат из фона — не действие пользователя в чате: остановленный догон он не будит. */
+    @Test
+    fun `возврат из фона не будит остановленный догон`() {
+        val dispatcher = ScriptedDispatcher()
+        val controller = startedScripted(dispatcher)
+        dispatcher.historyFallback = { ScriptedDispatcher.error(401, "device_not_found") }
+        await(controller) { it.connectionError?.code == "device_not_found" }
+        awaitIdle(scope)
+        val afterSuspend = server.requestCount
+
+        controller.onEnterForeground()
+
+        assertTrue(scope.coroutineContext.job.children.none { it.isActive })
+        assertEquals(afterSuspend, server.requestCount)
+    }
+
     /** Экран закрыт — фоновый возврат приложения не имеет права поднимать опрос. */
     @Test
     fun `возврат из фона при закрытом экране ничего не делает`() {
         val controller = started()
         controller.stop()
+        awaitIdle(scope)
         val afterStop = server.requestCount
 
         controller.onEnterForeground()
-        Thread.sleep(150)
 
+        assertTrue(scope.coroutineContext.job.children.none { it.isActive })
         assertEquals(afterStop, server.requestCount)
     }
 }
