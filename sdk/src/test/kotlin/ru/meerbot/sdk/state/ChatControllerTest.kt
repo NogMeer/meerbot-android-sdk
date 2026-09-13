@@ -4,6 +4,10 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.job
+import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.SocketPolicy
@@ -16,8 +20,10 @@ import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
+import ru.meerbot.sdk.R
 import ru.meerbot.sdk.network.ApiClient
 import ru.meerbot.sdk.network.MeerBotConfiguration
+import ru.meerbot.sdk.testing.ScriptedDispatcher
 import java.util.concurrent.TimeUnit
 
 /**
@@ -95,6 +101,11 @@ class ChatControllerTest {
             Thread.sleep(20)
         }
         fail("состояние не дождалось условия: ${controller.state.value}")
+    }
+
+    /** Дождаться, пока доработают все задачи контроллера, — вместо паузы наугад. */
+    private fun awaitControllerIdle() = runBlocking {
+        withTimeout(5_000) { scope.coroutineContext.job.children.toList().joinAll() }
     }
 
     @Test
@@ -358,12 +369,15 @@ class ChatControllerTest {
         val api = apiClient()
         val controller = started(messages = previousUserMessage, client = api)
         controller.stop()
+        awaitControllerIdle()
         val afterStop = server.requestCount
 
         api.logout()
         controller.resetForIdentityChange()
-        Thread.sleep(200)
 
+        // Ни одной живой задачи сразу после вызова: рукопожатие, запусти его сброс, уже было бы
+        // в scope. Пауза тут не нужна и ничего бы не доказала.
+        assertTrue(scope.coroutineContext.job.children.none { it.isActive })
         assertEquals(afterStop, server.requestCount)
         assertTrue(controller.state.value.messages.isEmpty())
         assertTrue(!controller.state.value.ready)
@@ -371,24 +385,60 @@ class ChatControllerTest {
 
     /**
      * Догон ушёл до выхода, страница прежнего пользователя пришла после. Отмены задачи здесь
-     * мало: `refresh()` запускает догон без хранимого `Job`.
+     * мало: `refresh()` запускает догон без хранимого `Job`. Порядок задан воротами сервера:
+     * запрос долетел → сменился пользователь → ответ отпущен.
      */
     @Test
     fun `страница, запрошенная до смены пользователя, в ленту не попадает`() {
-        val controller = started()
+        val dispatcher = ScriptedDispatcher().also { server.dispatcher = it }
+        val controller = controller()
+        controller.start()
+        await(controller) { it.ready }
         controller.stop()
-        server.enqueue(
-            history(messages = previousUserMessage).setBodyDelay(300, TimeUnit.MILLISECONDS)
-        )
+        awaitControllerIdle()
+        dispatcher.clearArrivals()
+        val gate = dispatcher.gateNextHistory(history(messages = previousUserMessage))
 
         controller.refresh()
-        server.takeRequest() // register
-        server.takeRequest() // стартовая история
-        assertNotNull(server.takeRequest(5, TimeUnit.SECONDS))
+        dispatcher.awaitHistory()
         controller.resetForIdentityChange()
-        Thread.sleep(600)
+        gate.countDown()
+        awaitControllerIdle()
 
         assertTrue(controller.state.value.messages.isEmpty())
+    }
+
+    /**
+     * Хост сменил токен дважды, пока шла отправка, а эпоха контроллера та же (смены человека
+     * не было): рукопожатие исчерпало попытки. Сообщение не ушло — пользователь обязан это
+     * увидеть и повторить, а не потерять его молча.
+     */
+    @Test
+    fun `исчерпанное рукопожатие без смены пользователя помечает сообщение недоставленным`() {
+        val dispatcher = ScriptedDispatcher().also { server.dispatcher = it }
+        val api = apiClient()
+        val controller = controller(api)
+        controller.start()
+        await(controller) { it.ready }
+        dispatcher.clearArrivals()
+        api.setIdentityToken("token-2")
+        val first = dispatcher.gateNextRegister()
+        val second = dispatcher.gateNextRegister()
+
+        controller.send("привет")
+        dispatcher.awaitRegister()
+        api.setIdentityToken("token-3")
+        first.countDown()
+        dispatcher.awaitRegister()
+        api.setIdentityToken("token-4")
+        second.countDown()
+
+        await(controller) { it.retryable != null }
+        val state = controller.state.value
+        assertEquals("привет", state.retryable)
+        assertEquals("cancelled", state.connectionError?.code)
+        assertTrue(state.messages.single { it.role == "user" }.failed)
+        assertTrue(!state.sending)
     }
 
     @Test
@@ -541,6 +591,30 @@ class ChatControllerCatchUpTest {
         Thread.sleep(200)
 
         assertEquals(afterStop, server.requestCount)
+    }
+
+    /**
+     * Сервер не признаёт устройство и после переподключения. Без остановки каждый тик — это
+     * рукопожатие и две истории, вечно и молча. Опрос встаёт (в scope не остаётся задач — новых
+     * запросов быть не может), экран говорит правду, повторное открытие возвращает догон.
+     */
+    @Test
+    fun `непризнанное после переподключения устройство останавливает фоновый догон`() {
+        val dispatcher = ScriptedDispatcher().also { server.dispatcher = it }
+        val controller = controller()
+        controller.start()
+        await(controller) { it.ready }
+
+        dispatcher.historyFallback = { ScriptedDispatcher.error(401, "device_not_found") }
+        await(controller) { it.connectionError?.code == "device_not_found" }
+        runBlocking { withTimeout(5_000) { scope.coroutineContext.job.children.toList().joinAll() } }
+
+        assertEquals(R.string.meerbot_err_session_lost, controller.state.value.connectionError?.messageRes)
+
+        dispatcher.historyFallback = { ScriptedDispatcher.history(mode = "human") }
+        controller.start()
+        await(controller) { it.connectionError == null }
+        assertTrue(scope.coroutineContext.job.children.any { it.isActive })
     }
 
     /** Экран закрыт — фоновый возврат приложения не имеет права поднимать опрос. */

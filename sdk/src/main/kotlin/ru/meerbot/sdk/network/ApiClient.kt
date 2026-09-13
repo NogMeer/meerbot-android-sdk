@@ -16,7 +16,6 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.Response
 import org.json.JSONObject
 import ru.meerbot.sdk.state.ChatMode
 import java.io.IOException
@@ -55,30 +54,12 @@ data class HistoryMessage(
 )
 
 /**
- * Где лежит сигнал «пользователь вышел», пока сервер его не подтвердил.
- *
- * Регистрация ленивая (первое открытие чата), а между `identify(null)` и ней процесс могут
- * убить. Потерянный сигнал оставил бы устройство привязанным к прежнему пользователю, и
- * следующий человек на телефоне увидел бы чужую переписку, — поэтому SDK хранит флаг в
- * prefs, а в тестах хватает памяти.
- */
-interface LogoutFlagStore {
-    var pending: Boolean
-}
-
-/** Флаг в памяти процесса: для тестов и хостов, собирающих [ApiClient] сами. */
-class InMemoryLogoutFlagStore(pending: Boolean = false) : LogoutFlagStore {
-    @Volatile
-    override var pending: Boolean = pending
-}
-
-/**
  * Клиент канала `mobile_app`: держит JWT, обновляет его по истечении и стримит ответы.
  *
  * Потокобезопасен: рукопожатие сериализовано мьютексом, поэтому параллельные отправки не
  * выписывают по своему JWT (сервер держит jti-allowlist, лишние токены — мусор).
  */
-class ApiClient(
+class ApiClient internal constructor(
     private val config: MeerBotConfiguration,
     private val visitorUuid: String,
     /**
@@ -91,10 +72,24 @@ class ApiClient(
      * уходит вебхуком на бэкенд интегратора (план поставки 1, этап E).
      */
     private val installationId: String,
-    private val httpClient: OkHttpClient = defaultHttpClient(),
+    private val httpClient: OkHttpClient,
     /** Сигнал выхода, не подтверждённый сервером. Переживает процесс, если хранилище это умеет. */
-    private val logoutFlag: LogoutFlagStore = InMemoryLogoutFlagStore(),
+    private val logoutFlag: LogoutFlagStore,
 ) {
+
+    /**
+     * Публичный конструктор ровно в форме 0.2.8 — `(config, visitorUuid, installationId,
+     * httpClient = default)`. Пятый параметр в публичной сигнатуре убрал бы из байткода и
+     * 4-аргументный конструктор, и синтетический с маской умолчаний: приложение, собранное
+     * против 0.2.8, падало бы `NoSuchMethodError` на патч-обновлении. Хранилище флага выхода —
+     * деталь `MeerBot`, снаружи его задавать незачем; здесь флаг живёт в памяти.
+     */
+    constructor(
+        config: MeerBotConfiguration,
+        visitorUuid: String,
+        installationId: String,
+        httpClient: OkHttpClient = defaultHttpClient(),
+    ) : this(config, visitorUuid, installationId, httpClient, InMemoryLogoutFlagStore())
 
     private val tokenMutex = Mutex()
 
@@ -105,11 +100,20 @@ class ApiClient(
     private val sessionLock = Any()
 
     /**
-     * Поколение identity: растёт на каждой смене токена и на выходе. Рукопожатие, начатое в
-     * прежнем поколении, своей сессии не сохраняет — иначе JWT, выписанный на привязанное
-     * устройство прежнего пользователя, пережил бы выход и открыл бы его ленту.
+     * Поколение identity: растёт при смене человека (выход, другой `sub`, первый токен).
+     * Рукопожатие, начатое в прежнем поколении, своей сессии не сохраняет — иначе JWT,
+     * выписанный на привязанное устройство прежнего пользователя, пережил бы выход и открыл
+     * бы его ленту. Пишется и читается только под [sessionLock].
      */
     private var generation = 0
+
+    /**
+     * Ревизия токена того же человека ([refreshIdentityToken]). Отдельно от [generation]: ответ,
+     * полученный со старым токеном ТОГО ЖЕ пользователя, чужим не является и сохраняется, а
+     * свежий токен применяется повтором, если попытка осталась. Хост, выпускающий токен на
+     * каждый вход в чат, иначе исчерпал бы попытки и потерял бы отправленное сообщение.
+     */
+    private var tokenRevision = 0
 
     @Volatile
     private var jwt: String? = null
@@ -149,7 +153,7 @@ class ApiClient(
      * текущая сессия сбрасывается, иначе identity подхватилась бы только через 15 минут.
      *
      * `null` здесь — только «токена нет», устройство от пользователя НЕ отвязывается: сервер
-     * держит связь, пока не придёт явный выход. Выход — [logout].
+     * держит связь, пока не придёт явный выход (`MeerBot.identify(null)`).
      */
     fun setIdentityToken(token: String?) {
         synchronized(sessionLock) {
@@ -160,18 +164,50 @@ class ApiClient(
     }
 
     /**
+     * Свежий токен ТОГО ЖЕ пользователя (тот же `sub`). Сессия переоткрывается с ним, но
+     * рукопожатие в полёте не отменяется: его ответ принадлежит тому же человеку.
+     */
+    internal fun refreshIdentityToken(token: String) {
+        synchronized(sessionLock) {
+            identityToken = token
+            tokenRevision++
+            invalidateToken()
+        }
+    }
+
+    /**
      * Выход пользователя. Следующее рукопожатие несёт `logout: true`, и сервер (с 0.2.9 SDK)
      * уводит привязанное устройство в отставку: прежний тред остаётся прежнему пользователю,
      * новый начинается пустым.
      *
-     * Флаг ставится ПЕРВЫМ и снимается только ответом, в котором сервер сообщил `unlinked`:
-     * старый сервер поле `logout` игнорирует, и сигнал уходит снова на каждом рукопожатии,
-     * пока сервер не обновят. Для устройства без связи повтор ничего не меняет.
+     * Флаг снимается только ответом, в котором сервер сообщил `unlinked`: старый сервер поле
+     * `logout` игнорирует, и сигнал уходит снова на каждом рукопожатии, пока сервер не обновят.
+     * Для устройства без связи повтор ничего не меняет.
      */
-    fun logout() {
+    internal fun logout() {
+        beginNewIdentity(token = null)
+    }
+
+    /**
+     * Вошёл ДРУГОЙ пользователь, а выхода прежнего не было. Это тот же выход плюс новый токен
+     * одним рукопожатием: без `logout` сервер, получив устаревший (или отклонённый) токен
+     * нового человека, оставил бы устройство за прежним — и новый увидел бы чужой тред.
+     * Сервер сам решает, привязать ли устройство к новому `sub`.
+     */
+    internal fun switchIdentity(token: String) {
+        beginNewIdentity(token = token)
+    }
+
+    /**
+     * Флаг, поколение и клиентское состояние прежнего человека меняются под одним замком: иначе
+     * рукопожатие, закончившееся между записью флага и сменой поколения, сняло бы только что
+     * поставленный флаг (его запрос ушёл без `logout`). Запись флага — `apply()` на
+     * in-memory prefs, диск пишется позже и замок не держит.
+     */
+    private fun beginNewIdentity(token: String?) {
         synchronized(sessionLock) {
             logoutFlag.pending = true
-            identityToken = null
+            identityToken = token
             generation++
             invalidateToken()
             conversationId = null
@@ -185,15 +221,25 @@ class ApiClient(
     suspend fun openSession(): MobileSession = tokenMutex.withLock { openSessionLocked() }
 
     private suspend fun openSessionLocked(): MobileSession {
+        // Сессия, уже сохранённая в этом вызове, и поколение, в котором её сохранили. Ответ
+        // получен токеном того же человека: если повтор со свежим токеном не удался, отдаём её,
+        // а не ошибку. Но только пока поколение то же — после смены человека она чужая.
+        var stored: MobileSession? = null
+        var storedIn = -1
+        fun storedIfCurrent(): MobileSession? =
+            stored?.takeIf { synchronized(sessionLock) { generation == storedIn } }
+
         // Поколение сменилось посреди запроса — ответ принадлежит прежней identity и
-        // отбрасывается. Повторов конечное число: хост, дёргающий identify() в цикле, не
-        // должен превратить рукопожатие в бесконечное.
+        // отбрасывается. Повторов конечное число (паритет с iOS): хост, дёргающий identify() в
+        // цикле, не должен превратить рукопожатие в бесконечное.
         repeat(MAX_REGISTER_ATTEMPTS) {
             val startedIn: Int
+            val startedRevision: Int
             val token: String?
             val logoutSent: Boolean
             synchronized(sessionLock) {
                 startedIn = generation
+                startedRevision = tokenRevision
                 token = identityToken
                 logoutSent = logoutFlag.pending
             }
@@ -211,38 +257,71 @@ class ApiClient(
                 .post(body.toString().toRequestBody(JSON))
                 .build()
 
-            val json = executeJson(request)
-            val jwtValue = json.optStringOrNull("jwt") ?: throw MeerBotError.InvalidResponse
-            val deviceId = json.optStringOrNull("deviceId") ?: throw MeerBotError.InvalidResponse
-            val expiresIn = json.optInt("expiresIn", 0)
-            if (expiresIn <= 0) throw MeerBotError.InvalidResponse
-
-            val identity = json.optJSONObject("identity")
-            val status = IdentityStatus.from(identity?.optStringOrNull("status"))
-
-            val committed = synchronized(sessionLock) {
-                if (generation != startedIn) return@synchronized false
-                jwt = jwtValue
-                jwtExpiresAtMs = System.currentTimeMillis() + expiresIn * 1000L
-                identityStatus = status
-                // Наличие поля, а не его значение: `unlinked = false` — выход принят, но
-                // отвязывать было нечего. Поля нет — сервер старый и выход не понял.
-                if (logoutSent && identity?.has("unlinked") == true) logoutFlag.pending = false
-                true
+            val raw = try {
+                execute(request)
+            } catch (e: MeerBotError) {
+                storedIfCurrent()?.let { return it }
+                throw e
             }
-            if (!committed) return@repeat
+            // Поколение сверяется ДО разбора: ответ прежней identity — чужой, будь он хоть
+            // битым, хоть отказом. Бросить его ошибку значило бы показать новому человеку
+            // провал запроса, которого он не делал, вместо повтора с его токеном.
+            if (synchronized(sessionLock) { generation != startedIn }) return@repeat
 
-            return MobileSession(
-                deviceId = deviceId,
-                jwt = jwtValue,
-                expiresIn = expiresIn,
-                attestationRequired = json.optBoolean("attestationRequired", false),
-                identityStatus = status,
-            )
+            val session = try {
+                parseSession(raw, logoutSent, startedIn)
+            } catch (e: MeerBotError) {
+                storedIfCurrent()?.let { return it }
+                throw e
+            } ?: return@repeat
+            stored = session
+            storedIn = startedIn
+
+            val refreshed = synchronized(sessionLock) { tokenRevision != startedRevision }
+            if (!refreshed) return session
         }
-        // Отмена, а не сетевая ошибка: сессию отменила смена пользователя, и её вызывающая
-        // сторона (контроллер) к этому моменту уже перезапущена.
+        storedIfCurrent()?.let { return it }
+        // Отмена, а не сетевая ошибка: рукопожатие перебили смены пользователя. Контроллер
+        // считает её безобидной, только если сменилась и его эпоха.
         throw MeerBotError.Cancelled
+    }
+
+    /**
+     * Разобрать ответ рукопожатия и сохранить сессию. `null` — пока разбирали, поколение
+     * сменилось, и сессия не сохранена.
+     */
+    private fun parseSession(raw: RawResponse, logoutSent: Boolean, startedIn: Int): MobileSession? {
+        val json = parseJson(raw)
+        val jwtValue = json.optStringOrNull("jwt") ?: throw MeerBotError.InvalidResponse
+        val deviceId = json.optStringOrNull("deviceId") ?: throw MeerBotError.InvalidResponse
+        val expiresIn = json.optInt("expiresIn", 0)
+        if (expiresIn <= 0) throw MeerBotError.InvalidResponse
+
+        val identity = json.optJSONObject("identity")
+        val status = IdentityStatus.from(identity?.optStringOrNull("status"))
+        // Выход подтверждён, только если `unlinked` — булево значение (`false` — отвязывать
+        // было нечего, но выход понят). Нет поля, `null` или строка — сервер старый либо ответ
+        // кривой, и сигнал уйдёт снова. Паритет с iOS (`identity["unlinked"] is Bool`).
+        val unlinkedConfirmed = identity != null && !identity.isNull("unlinked") &&
+            identity.opt("unlinked") is Boolean
+
+        val committed = synchronized(sessionLock) {
+            if (generation != startedIn) return@synchronized false
+            jwt = jwtValue
+            jwtExpiresAtMs = System.currentTimeMillis() + expiresIn * 1000L
+            identityStatus = status
+            if (logoutSent && unlinkedConfirmed) logoutFlag.pending = false
+            true
+        }
+        if (!committed) return null
+
+        return MobileSession(
+            deviceId = deviceId,
+            jwt = jwtValue,
+            expiresIn = expiresIn,
+            attestationRequired = json.optBoolean("attestationRequired", false),
+            identityStatus = status,
+        )
     }
 
     /**
@@ -406,15 +485,28 @@ class ApiClient(
     private fun Request.Builder.applyCommonHeaders(): Request.Builder =
         header("X-SDK-Version", config.sdkVersion)
 
-    /** Запрос без Authorization (рукопожатие). */
-    private suspend fun executeJson(request: Request): JSONObject = withContext(Dispatchers.IO) {
+    /** Ответ, прочитанный целиком, но ещё не разобранный. */
+    private class RawResponse(val code: Int, val successful: Boolean, val text: String?)
+
+    /** Выполнить запрос и прочитать тело. Разбор — отдельно: рукопожатию нужно сперва сверить поколение. */
+    private suspend fun execute(request: Request): RawResponse = withContext(Dispatchers.IO) {
         val response = try {
             httpClient.newCall(request).execute()
         } catch (e: IOException) {
             throw MeerBotError.Network(e.message ?: "io")
         }
-        response.use { parseJson(it) }
+        response.use {
+            val text = try {
+                it.body?.string()
+            } catch (e: IOException) {
+                throw MeerBotError.Network(e.message ?: "io")
+            }
+            RawResponse(it.code, it.isSuccessful, text)
+        }
     }
+
+    /** Запрос без Authorization. */
+    private suspend fun executeJson(request: Request): JSONObject = parseJson(execute(request))
 
     /** Запрос с Authorization: 401 по протухшему JWT обновляет сессию и повторяется один раз. */
     private suspend fun executeAuthorizedJson(build: (String) -> Request): JSONObject {
@@ -427,18 +519,17 @@ class ApiClient(
         }
     }
 
-    private fun parseJson(response: Response): JSONObject {
-        val text = response.body?.string()
-        if (!response.isSuccessful) throw decodeError(response.code, text)
-        if (text.isNullOrEmpty()) throw MeerBotError.InvalidResponse
-        return runCatching { JSONObject(text) }.getOrElse { throw MeerBotError.InvalidResponse }
+    private fun parseJson(raw: RawResponse): JSONObject {
+        if (!raw.successful) throw decodeError(raw.code, raw.text)
+        if (raw.text.isNullOrEmpty()) throw MeerBotError.InvalidResponse
+        return runCatching { JSONObject(raw.text) }.getOrElse { throw MeerBotError.InvalidResponse }
     }
 
     companion object {
         private val JSON = "application/json; charset=utf-8".toMediaType()
         private const val TOKEN_MIN_LIFETIME_MS = 60_000L
-        /** Первая попытка рукопожатия и до двух повторов после смены identity в полёте. */
-        private const val MAX_REGISTER_ATTEMPTS = 3
+        /** Первая попытка рукопожатия и один повтор после смены identity в полёте (как iOS). */
+        private const val MAX_REGISTER_ATTEMPTS = 2
         private const val STREAM_READ_TIMEOUT_S = 60L
 
         fun defaultHttpClient(): OkHttpClient = OkHttpClient.Builder()

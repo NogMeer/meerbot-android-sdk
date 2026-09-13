@@ -2,17 +2,37 @@ package ru.meerbot.sdk.network
 
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import java.security.MessageDigest
+
+/** Что означает очередной `identify` по сравнению с последним применённым. */
+internal enum class IdentityChange {
+    /** Токена не было (аноним или после выхода) — появился. Лента очищается. */
+    SignIn,
+
+    /** Свежий токен того же `sub`. Лента не трогается, флаг выхода не ставится. */
+    Refresh,
+
+    /** Токен ДРУГОГО `sub` без выхода прежнего: выход + вход одним рукопожатием. */
+    Switch,
+
+    /** `identify(null)`. */
+    Logout,
+}
 
 /**
- * Чей это identity-токен — только чтобы решить, чистить ли ленту. Паритет с iOS
- * `MeerBot.identitySubject(of:)`.
+ * Чей это identity-токен — чтобы решить, чистить ли ленту и рвать ли связь прежнего
+ * пользователя. Паритет с iOS `MeerBot.identitySubject(of:)`.
  *
  * Подпись здесь не проверяется и не должна: связь устройства с пользователем устанавливает
  * сервер, а по этому значению решается лишь, сменился ли человек на экране.
  */
 internal object IdentitySubject {
 
-    /** `sub` из полезной нагрузки JWT. `null` — токен не JWT или строкового `sub` в нём нет. */
+    /**
+     * `sub` из полезной нагрузки JWT, обрезанный по краям, как его обрезает сервер (иначе
+     * `" user-42"` и `"user-42"` были бы для SDK разными людьми, а для сервера — одним).
+     * `null` — токен не JWT или строкового непустого `sub` в нём нет.
+     */
     fun of(token: String): String? {
         val parts = token.split(".")
         if (parts.size != 3) return null
@@ -21,25 +41,40 @@ internal object IdentitySubject {
             ?: return null
         // `opt` + приведение, а не `optString`: тот превратил бы числовой `sub` в строку, а
         // iOS такой токен считает токеном без `sub` — решения SDK не должны расходиться.
-        return (claims.opt("sub") as? String)?.takeIf { it.isNotEmpty() }
+        return (claims.opt("sub") as? String)?.trim()?.takeIf { it.isNotEmpty() }
+    }
+
+    /** Ключ сравнения: `sub`, а у нечитаемого токена — сама строка (сравнивать больше нечего). */
+    fun key(token: String): String = of(token) ?: token
+
+    /**
+     * Хеш ключа, привязанный к установке. На диск ложится он, а не `sub`: идентификатор
+     * пользователя интегратора — его персональные данные, и в prefs SDK им делать нечего.
+     * Привязка к `installationId` не даёт хешу пережить `reset()` в виде «того же человека».
+     */
+    fun hash(installationId: String, key: String): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest("$installationId\n$key".toByteArray(Charsets.UTF_8))
+        return digest.joinToString("") { "%02x".format(it) }
     }
 
     /**
-     * Ключ сравнения: `sub`, а у нечитаемого токена — сама строка (сравнивать больше нечего).
-     * `null` — токена нет (выход).
-     */
-    fun key(token: String?): String? = token?.let { of(it) ?: it }
-
-    /**
-     * Чистить ли ленту на `identify(newToken)`.
+     * Решение по хешам: прежний (`null` — токена не было или был выход) и новый (`null` —
+     * `identify(null)`).
      *
-     * Выход — всегда: связь могла остаться с прошлого запуска, когда `identify` в этом
-     * процессе ещё не звали. Токен — только если сменился человек: хост выпускает свежий
-     * токен на каждый вход в чат, и сравнение строк сбрасывало бы ленту (и обрывало
-     * стримящийся ответ) на каждом таком вызове.
+     * Выход — всегда выход: связь могла остаться с прошлого запуска. Свежий токен того же
+     * человека ленту не трогает: хост выпускает его на каждый вход в чат, и сброс обрывал бы
+     * стримящийся ответ. Другой человек без выхода — [IdentityChange.Switch]: только лента
+     * здесь не спасает, сервер с устаревшим токеном нового оставил бы устройство за прежним.
+     * Первый вход после анонима выход не шлёт: рвать нечего, а после обновления с 0.2.8, где
+     * хеша ещё нет, это стёрло бы историю вошедшему заново тому же человеку.
      */
-    fun shouldResetFeed(previousKey: String?, newToken: String?): Boolean =
-        newToken == null || key(newToken) != previousKey
+    fun change(previousHash: String?, newHash: String?): IdentityChange = when {
+        newHash == null -> IdentityChange.Logout
+        previousHash == null -> IdentityChange.SignIn
+        previousHash == newHash -> IdentityChange.Refresh
+        else -> IdentityChange.Switch
+    }
 
     /**
      * base64url без обязательного паддинга. Свой разбор, а не `java.util.Base64`: тот есть

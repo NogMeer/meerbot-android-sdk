@@ -1,13 +1,13 @@
 package ru.meerbot.sdk.network
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Решение «чистить ли ленту» на `identify`. Хост выпускает свежий токен на каждый вход в чат
+ * Решение «что значит этот identify». Хост выпускает свежий токен на каждый вход в чат
  * (токены живут минуты), поэтому лента обязана сбрасываться только при смене человека, а не
  * при смене строки токена — иначе она мигала бы и обрывала стримящийся ответ.
  */
@@ -19,6 +19,12 @@ class IdentitySubjectTest {
     fun `sub читается из полезной нагрузки`() {
         // {"sub":"user-42","iat":1757750400}
         assertEquals("user-42", IdentitySubject.of(token("eyJzdWIiOiJ1c2VyLTQyIiwiaWF0IjoxNzU3NzUwNDAwfQ")))
+    }
+
+    @Test
+    fun `sub обрезается по краям, как на сервере`() {
+        assertEquals("user-42", IdentitySubject.of(Jwt.withSub("  user-42 ")))
+        assertNull(IdentitySubject.of(Jwt.withSub("   ")))
     }
 
     @Test
@@ -54,43 +60,63 @@ class IdentitySubjectTest {
     }
 
     @Test
-    fun `свежий токен того же пользователя ленту не чистит`() {
-        val first = token("eyJzdWIiOiJ1c2VyLTQyIiwiaWF0IjoxNzU3NzUwNDAwfQ")
-        val refreshed = token("eyJzdWIiOiJ1c2VyLTQyIiwieCI6Ij8-In0")
-        assertTrue(first != refreshed)
-
-        assertFalse(IdentitySubject.shouldResetFeed(IdentitySubject.key(first), refreshed))
-    }
-
-    @Test
-    fun `токен другого пользователя ленту чистит`() {
-        // {"sub":"user-7"}
-        val other = token("eyJzdWIiOiJ1c2VyLTcifQ")
-        assertTrue(IdentitySubject.shouldResetFeed("user-42", other))
-    }
-
-    @Test
-    fun `первый токен в процессе ленту чистит`() {
-        // До него клиент был анонимным: лента могла принадлежать прежнему пользователю.
-        assertTrue(IdentitySubject.shouldResetFeed(null, token("eyJzdWIiOiJ1c2VyLTcifQ")))
-    }
-
-    @Test
-    fun `выход чистит ленту всегда`() {
-        assertTrue(IdentitySubject.shouldResetFeed("user-42", null))
-        assertTrue(IdentitySubject.shouldResetFeed(null, null))
-        assertNull(IdentitySubject.key(null))
-    }
-
-    @Test
     fun `нечитаемые токены сравниваются строкой`() {
         assertEquals("opaque-1", IdentitySubject.key("opaque-1"))
-        assertFalse(IdentitySubject.shouldResetFeed("opaque-1", "opaque-1"))
-        assertTrue(IdentitySubject.shouldResetFeed("opaque-1", "opaque-2"))
+        assertEquals("user-42", IdentitySubject.key(Jwt.withSub("user-42")))
     }
+
+    @Test
+    fun `свежий токен того же пользователя — обновление`() {
+        val first = hashOf(Jwt.withSub("user-42", iat = 1))
+        val refreshed = hashOf(Jwt.withSub("user-42", iat = 2))
+
+        assertEquals(IdentityChange.Refresh, IdentitySubject.change(first, refreshed))
+    }
+
+    @Test
+    fun `токен другого пользователя без выхода — смена`() {
+        assertEquals(
+            IdentityChange.Switch,
+            IdentitySubject.change(hashOf(Jwt.withSub("user-42")), hashOf(Jwt.withSub("user-7"))),
+        )
+    }
+
+    @Test
+    fun `первый токен после анонима — вход`() {
+        assertEquals(IdentityChange.SignIn, IdentitySubject.change(null, hashOf(Jwt.withSub("user-7"))))
+    }
+
+    @Test
+    fun `выход — всегда выход`() {
+        assertEquals(IdentityChange.Logout, IdentitySubject.change(hashOf(Jwt.withSub("user-42")), null))
+        assertEquals(IdentityChange.Logout, IdentitySubject.change(null, null))
+    }
+
+    @Test
+    fun `хеш привязан к установке и не содержит sub`() {
+        val a = IdentitySubject.hash("and-1", "user-42")
+        assertNotEquals(a, IdentitySubject.hash("and-2", "user-42"))
+        assertEquals(a, IdentitySubject.hash("and-1", "user-42"))
+        assertEquals(64, a.length)
+        assertTrue(!a.contains("user-42"))
+    }
+
+    private fun hashOf(token: String) = IdentitySubject.hash("and-1", IdentitySubject.key(token))
 
     private companion object {
         /** {"alg":"HS256","typ":"JWT"} */
         const val HEADER = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+    }
+}
+
+/** JWT-подобная строка с заданным `sub`. Подпись SDK не проверяет, поэтому она условная. */
+object Jwt {
+    fun withSub(sub: String, iat: Long = 1_757_750_400): String {
+        val encoder = java.util.Base64.getUrlEncoder().withoutPadding()
+        val header = encoder.encodeToString("""{"alg":"HS256","typ":"JWT"}""".toByteArray())
+        val payload = encoder.encodeToString(
+            org.json.JSONObject().put("sub", sub).put("iat", iat).toString().toByteArray(),
+        )
+        return "$header.$payload.signature"
     }
 }

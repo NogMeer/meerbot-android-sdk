@@ -1,5 +1,6 @@
 package ru.meerbot.sdk.state
 
+import androidx.annotation.MainThread
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -24,6 +25,11 @@ import java.util.concurrent.atomic.AtomicInteger
  * сессия SDK, и поэтому переживает и поворот экрана, и пересоздание активити — открытый
  * SSE-поток не рвётся. ViewModel здесь была бы лишней ступенью, которая к тому же
  * застревала бы на старом контроллере после повторного `configure(...)`.
+ *
+ * Потоки: методы управления — только с главного потока, а `scope` обязан диспетчеризовать на
+ * него же (у `MeerBot` — `Dispatchers.Main.immediate`). Задачи и флаги экрана — обычные поля:
+ * `stop()` с чужого потока гонялся бы со `start()` экрана (двойной старт, потерянный
+ * `streamJob`, и поток прежнего пользователя писал бы в очищенную ленту).
  */
 class ChatController(
     private val client: ApiClient,
@@ -38,6 +44,14 @@ class ChatController(
     private var pollJob: Job? = null
     /** Экран чата на виду. Догон крутится ТОЛЬКО когда экран открыт и сессия готова. */
     private var screenVisible = false
+
+    /**
+     * Фоновый догон остановлен: сессия не восстанавливается (`device_not_found` и `jwt_*` после
+     * уже сделанного переподключения). Без остановки каждый тик — рукопожатие и две истории,
+     * вечно и молча. Снимается повторным открытием экрана или удачным догоном по явному
+     * действию (отправка, `refresh()`, возврат из фона).
+     */
+    private var catchUpSuspended = false
 
     /**
      * Эпоха identity: растёт на каждой смене пользователя. Запрос ленты, отправленный в
@@ -56,8 +70,10 @@ class ChatController(
     }
 
     /** Открыть сессию и подтянуть историю прошлого диалога (если он восстановлен сервером). */
+    @MainThread
     fun start() {
         screenVisible = true
+        catchUpSuspended = false
         if (startJob?.isActive == true) return
 
         // Сессия уже поднята: контроллер живёт в синглтоне SDK и переживает закрытие экрана.
@@ -98,9 +114,11 @@ class ChatController(
      * обязано пройти рукопожатие заново. Если экран сейчас на виду, он перезапускается сам;
      * закрытый экран сети не трогает.
      */
-    fun resetForIdentityChange() {
+    @MainThread
+    internal fun resetForIdentityChange() {
         val wasVisible = screenVisible
         identityEpoch.incrementAndGet()
+        catchUpSuspended = false
         stop()
         store.resetForIdentityChange()
         if (wasVisible) start()
@@ -108,6 +126,7 @@ class ChatController(
 
     fun setDraft(text: String) = store.setDraft(text)
 
+    @MainThread
     fun send(text: String) {
         val trimmed = text.trim()
         if (trimmed.isEmpty() || store.sending || store.mode == ChatMode.Closed) return
@@ -118,6 +137,7 @@ class ChatController(
     }
 
     /** Повторить последнюю неудачную отправку. */
+    @MainThread
     fun retry() {
         val text = store.state.value.retryable ?: return
         store.setRetryable(null)
@@ -147,6 +167,7 @@ class ChatController(
      * Приложение вернулось на передний план: догоняем немедленно, не дожидаясь тика.
      * Зовётся экраном SDK; хосту со своим UI доступен через `MeerBot.chatController()`.
      */
+    @MainThread
     fun onEnterForeground() {
         if (!screenVisible || !store.state.value.ready) return
         scope.launch { catchUp(silent = true) }
@@ -154,6 +175,7 @@ class ChatController(
     }
 
     /** Ушли в фон: опрос останавливаем — там он даёт только трафик. */
+    @MainThread
     fun onEnterBackground() = stopPolling()
 
     /**
@@ -163,6 +185,7 @@ class ChatController(
      */
     val conversationId: Long? get() = client.conversationId
 
+    @MainThread
     fun stop() {
         screenVisible = false
         stopPolling()
@@ -185,9 +208,9 @@ class ChatController(
      * каждом витке, поэтому переход диалога к человеку ускоряет догон со следующего тика.
      */
     private fun startPolling() {
-        if (pollJob?.isActive == true) return
+        if (catchUpSuspended || pollJob?.isActive == true) return
         pollJob = scope.launch {
-            while (isActive) {
+            while (isActive && !catchUpSuspended) {
                 val mode = store.mode
                 val interval =
                     if (mode == ChatMode.Human || mode == ChatMode.PendingEscalation) {
@@ -241,10 +264,25 @@ class ChatController(
             // Баннер снимаем, только если повторять нечего: иначе с экрана исчезла бы кнопка
             // «Повторить» вместе с объяснением, почему она там.
             if (store.state.value.retryable == null) store.setError(null)
+            // Сессия снова в порядке (догон по явному действию) — фоновый догон возвращается.
+            if (catchUpSuspended) {
+                catchUpSuspended = false
+                if (screenVisible) startPolling()
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
-            if (!silent && identityEpoch.get() == startedEpoch) store.setError(chatError(e))
+            if (identityEpoch.get() != startedEpoch) return
+            if (e is MeerBotError && e.isExpiredToken) {
+                // Клиент уже переподключился один раз, и сервер снова не признал устройство.
+                // Молча крутить это каждые 6–12 секунд нельзя: догон встаёт до явного действия,
+                // а экран говорит правду даже для фонового тика.
+                catchUpSuspended = true
+                stopPolling()
+                store.setError(chatError(e))
+                return
+            }
+            if (!silent) store.setError(chatError(e))
         }
     }
 
@@ -255,6 +293,9 @@ class ChatController(
         store.setError(null)
         store.setSending(true)
         val placeholderId = store.appendAssistantPlaceholder().id
+        // Эпоха — на момент отправки, а не провала: иначе смена пользователя, случившаяся во
+        // время отправки, не отличалась бы от провала в той же сессии.
+        val sentInEpoch = identityEpoch.get()
 
         streamJob = scope.launch {
             try {
@@ -273,7 +314,7 @@ class ChatController(
                 store.dropEmptyPlaceholder(placeholderId)
                 throw e
             } catch (e: Throwable) {
-                handleFailure(e, text, userMessageId, placeholderId)
+                handleFailure(e, text, userMessageId, placeholderId, sentInEpoch)
             }
         }
     }
@@ -335,15 +376,26 @@ class ChatController(
         text: String,
         userMessageId: String,
         placeholderId: String,
+        sentInEpoch: Int,
     ) {
         store.setSending(false)
         store.finalizeAssistant(placeholderId)
         store.dropEmptyPlaceholder(placeholderId)
 
-        if (error is MeerBotError.Cancelled) return
-        val startedEpoch = identityEpoch.get()
+        // Пользователь сменился: сообщение принадлежит прежнему, его новой ленте ни баннер, ни
+        // «Повторить» не нужны. Только это и делает отмену безобидной.
+        if (identityEpoch.get() != sentInEpoch) return
+        val startedEpoch = sentInEpoch
 
         store.setError(chatError(error))
+
+        // Отмена в той же эпохе — рукопожатие исчерпало попытки, пока хост менял токены. Сессии
+        // нет, сообщение не ушло: молча проглотить её значило бы потерять его без следа.
+        if (error is MeerBotError.Cancelled) {
+            store.setFailed(userMessageId, true)
+            store.setRetryable(text)
+            return
+        }
 
         // Ответ мог быть дописан сервером, пока рвалось соединение. Серверную ленту
         // принимаем ТОЛЬКО если она заканчивается ответом: иначе замена выбросила бы из UI

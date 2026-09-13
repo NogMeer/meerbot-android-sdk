@@ -4,4 +4,16 @@
     <!-- Единственное разрешение SDK: чат ходит по HTTPS в meerbot.ru. -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <application>
+        <!--
+            Контекст приложения до MeerBot.configure(...): без него выход, запрошенный раньше
+            настройки, жил бы только в памяти и терялся с процессом. Провайдер не экспортирован,
+            данных не отдаёт и в onCreate ничего не читает с диска сам.
+        -->
+        <provider
+            android:name="ru.meerbot.sdk.internal.MeerBotContextProvider"
+            android:authorities="${applicationId}.meerbot-sdk-context"
+            android:exported="false" />
+    </application>
+
 </manifest>

@@ -20,6 +20,7 @@ import org.junit.Before
 import org.junit.Test
 import ru.meerbot.sdk.R
 import ru.meerbot.sdk.state.ChatMode
+import ru.meerbot.sdk.testing.ScriptedDispatcher
 import java.util.concurrent.TimeUnit
 
 /**
@@ -51,8 +52,12 @@ class ApiClientTest {
         ),
         visitorUuid = VISITOR,
         installationId = INSTALLATION,
+        httpClient = ApiClient.defaultHttpClient(),
         logoutFlag = logoutFlag,
     )
+
+    /** Сервер с воротами: ответ рукопожатия уходит только по сигналу теста. */
+    private fun gated(): ScriptedDispatcher = ScriptedDispatcher().also { server.dispatcher = it }
 
     /** `unlinked = null` — ответ старого сервера, который поля не знает. */
     private fun registerResponse(
@@ -278,27 +283,165 @@ class ApiClientTest {
     @Test
     fun `рукопожатие, начатое до выхода, своей сессии не сохраняет`() = runBlocking {
         val flag = InMemoryLogoutFlagStore()
-        server.enqueue(
-            registerResponse(jwt = "jwt-linked", identityStatus = "verified")
-                .setBodyDelay(400, TimeUnit.MILLISECONDS)
-        )
-        server.enqueue(registerResponse(jwt = "jwt-anon", unlinked = true))
+        val dispatcher = gated()
+        val gate = dispatcher.gateNextRegister(registerResponse(jwt = "jwt-linked", identityStatus = "verified"))
+        dispatcher.registerFallback = { registerResponse(jwt = "jwt-anon", unlinked = true) }
         val api = client(flag)
         api.setIdentityToken("signed")
 
         val token = withContext(Dispatchers.Default) {
             val pending = async { api.validToken() }
-            val first = JSONObject(server.takeRequest(5, TimeUnit.SECONDS)!!.body.readUtf8())
-            assertEquals("signed", first.getString("identityToken"))
+            assertEquals("signed", JSONObject(dispatcher.awaitRegister().body.readUtf8()).getString("identityToken"))
             api.logout()
+            gate.countDown()
             pending.await()
         }
 
         assertEquals("jwt-anon", token)
-        assertEquals(2, server.requestCount)
-        assertTrue(registerBody().getBoolean("logout"))
+        val retry = JSONObject(dispatcher.awaitRegister().body.readUtf8())
+        assertTrue(retry.getBoolean("logout"))
+        assertFalse(retry.has("identityToken"))
         assertFalse(flag.pending)
         assertEquals("jwt-anon", api.validToken())
+        assertEquals(2, server.requestCount)
+    }
+
+    /**
+     * Ответ прежнему пользователю чужой, даже битый: его ошибка показала бы новому человеку
+     * провал запроса, которого тот не делал. Поколение сверяется до разбора тела.
+     */
+    @Test
+    fun `битый ответ прежнему пользователю уходит в повтор, а не в ошибку`() = runBlocking {
+        val dispatcher = gated()
+        val gate = dispatcher.gateNextRegister(MockResponse().setBody("<html>gateway</html>"))
+        dispatcher.registerFallback = { registerResponse(jwt = "jwt-B") }
+        val api = client()
+
+        val token = withContext(Dispatchers.Default) {
+            val pending = async { api.validToken() }
+            dispatcher.awaitRegister()
+            api.setIdentityToken("B")
+            gate.countDown()
+            pending.await()
+        }
+
+        assertEquals("jwt-B", token)
+        assertEquals("B", JSONObject(dispatcher.awaitRegister().body.readUtf8()).getString("identityToken"))
+    }
+
+    @Test
+    fun `две смены пользователя в полёте исчерпывают обе попытки`() = runBlocking {
+        val dispatcher = gated()
+        val first = dispatcher.gateNextRegister()
+        val second = dispatcher.gateNextRegister()
+        val api = client()
+
+        val error = withContext(Dispatchers.Default) {
+            val pending = async { runCatching { api.validToken() }.exceptionOrNull() }
+            dispatcher.awaitRegister()
+            api.setIdentityToken("B")
+            first.countDown()
+            dispatcher.awaitRegister()
+            api.setIdentityToken("C")
+            second.countDown()
+            pending.await()
+        }
+
+        assertEquals(MeerBotError.Cancelled, error)
+        assertEquals(2, server.requestCount)
+    }
+
+    /**
+     * Хост выпускает токен на каждый вход в чат. Ответ со старым токеном того же человека не
+     * чужой: он сохраняется, а свежий токен применяется повтором — и частые обновления не
+     * превращаются в отмену, из-за которой терялась отправка.
+     */
+    @Test
+    fun `свежие токены того же пользователя в полёте не отменяют рукопожатие`() = runBlocking {
+        val dispatcher = gated()
+        val first = dispatcher.gateNextRegister(registerResponse(jwt = "jwt-1"))
+        val second = dispatcher.gateNextRegister(registerResponse(jwt = "jwt-2"))
+        val api = client()
+        api.setIdentityToken("A1")
+
+        val token = withContext(Dispatchers.Default) {
+            val pending = async { api.validToken() }
+            dispatcher.awaitRegister()
+            api.refreshIdentityToken("A2")
+            first.countDown()
+            assertEquals("A2", JSONObject(dispatcher.awaitRegister().body.readUtf8()).getString("identityToken"))
+            api.refreshIdentityToken("A3")
+            second.countDown()
+            pending.await()
+        }
+
+        assertEquals("jwt-2", token)
+        assertEquals(2, server.requestCount)
+    }
+
+    @Test
+    fun `смена пользователя без выхода уходит выходом и новым токеном`() = runBlocking {
+        server.enqueue(registerResponse(identityStatus = "verified"))
+        server.enqueue(registerResponse(identityStatus = "rejected", unlinked = true))
+        val flag = InMemoryLogoutFlagStore()
+        val api = client(flag)
+        api.setIdentityToken("A")
+        api.openSession()
+        api.rememberConversationId(77)
+
+        api.switchIdentity("B")
+
+        assertTrue(flag.pending)
+        assertNull(api.conversationId)
+        assertNull(api.lastMessageId)
+        assertEquals(IdentityStatus.NotProvided, api.identityStatus)
+        api.openSession()
+        assertEquals("A", registerBody().getString("identityToken"))
+        val body = registerBody()
+        assertTrue(body.getBoolean("logout"))
+        assertEquals("B", body.getString("identityToken"))
+        assertFalse(flag.pending)
+    }
+
+    @Test
+    fun `свежий токен того же пользователя выход не шлёт и диалог не сбрасывает`() = runBlocking {
+        server.enqueue(registerResponse(identityStatus = "verified"))
+        server.enqueue(registerResponse(jwt = "jwt-2", identityStatus = "verified"))
+        val flag = InMemoryLogoutFlagStore()
+        val api = client(flag)
+        api.setIdentityToken("A1")
+        api.validToken()
+        api.rememberConversationId(77)
+
+        api.refreshIdentityToken("A2")
+
+        assertEquals("jwt-2", api.validToken())
+        registerBody()
+        val body = registerBody()
+        assertFalse(body.has("logout"))
+        assertEquals("A2", body.getString("identityToken"))
+        assertFalse(flag.pending)
+        assertEquals(77L, api.conversationId)
+    }
+
+    @Test
+    fun `unlinked не булевым значением выход не подтверждает`() = runBlocking {
+        val flag = InMemoryLogoutFlagStore()
+        server.enqueue(
+            MockResponse().setBody("""{"deviceId":"42","jwt":"j1","expiresIn":900,"identity":{"status":"not_provided","unlinked":"true"}}"""),
+        )
+        server.enqueue(
+            MockResponse().setBody("""{"deviceId":"42","jwt":"j2","expiresIn":900,"identity":{"status":"not_provided","unlinked":null}}"""),
+        )
+        val api = client(flag)
+        api.logout()
+
+        api.openSession()
+        assertTrue(flag.pending)
+        api.invalidateToken()
+        api.openSession()
+
+        assertTrue(flag.pending)
     }
 
     @Test
@@ -323,6 +466,11 @@ class ApiClientTest {
         assertTrue(ApiClient.decodeError(401, """{"error":{"code":"device_claim_missing"}}""").isExpiredToken)
         assertTrue(ApiClient.decodeError(401, """{"error":{"code":"device_not_found"}}""").isExpiredToken)
         assertFalse(ApiClient.decodeError(403, """{"error":{"code":"channel_mismatch"}}""").isExpiredToken)
+        // До экрана она доходит, только когда переподключение уже не помогло.
+        assertEquals(
+            R.string.meerbot_err_session_lost,
+            ApiClient.decodeError(401, """{"error":{"code":"device_not_found"}}""").messageRes,
+        )
     }
 
     @Test

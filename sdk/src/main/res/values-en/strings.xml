@@ -27,7 +27,8 @@
     <string name="meerbot_err_message_too_long">The message is too long.</string>
     <string name="meerbot_err_identity_required">Sign in to the app to use the chat.</string>
     <string name="meerbot_err_invalid_response">Unexpected server response.</string>
-    <string name="meerbot_err_cancelled">Cancelled.</string>
+    <string name="meerbot_err_cancelled">Connection was interrupted. Please try again.</string>
+    <string name="meerbot_err_session_lost">Could not restore the session. Close the chat and open it again.</string>
 
     <string name="meerbot_not_configured_title">MeerBot is not configured</string>
     <string name="meerbot_not_configured_body">Call MeerBot.configure(context, apiKey) on app start.</string>

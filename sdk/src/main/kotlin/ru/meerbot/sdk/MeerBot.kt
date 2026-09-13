@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
+import androidx.annotation.MainThread
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -13,11 +14,14 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import okhttp3.OkHttpClient
+import ru.meerbot.sdk.internal.EarlyLogout
+import ru.meerbot.sdk.internal.MainThreadSerialExecutor
 import ru.meerbot.sdk.network.ApiClient
+import ru.meerbot.sdk.network.IdentityCoordinator
 import ru.meerbot.sdk.network.IdentityStatus
-import ru.meerbot.sdk.network.IdentitySubject
-import ru.meerbot.sdk.network.LogoutFlagStore
 import ru.meerbot.sdk.network.MeerBotConfiguration
+import ru.meerbot.sdk.network.PrefsLogoutFlagStore
+import ru.meerbot.sdk.network.PrefsSubjectHashStore
 import ru.meerbot.sdk.state.ChatController
 import ru.meerbot.sdk.ui.NotConfiguredScreen
 import java.util.UUID
@@ -35,6 +39,11 @@ import ru.meerbot.sdk.ui.ChatScreen as ChatScreenImpl
  *
  * SDK работает с каналом `mobile_app`: один ключ, свои эндпоинты, свой тред на устройство
  * (docs/mobile-sdk/android.md).
+ *
+ * Потоки: `configure`, `identify`, `reset` и `preconnect` можно звать с любого потока. Их
+ * действие применяется на главном потоке строго в порядке вызова; с главного потока — сразу
+ * (если очередь пуста), с фонового — асинхронно, к возврату из метода оно может быть ещё не
+ * применено.
  */
 @SuppressLint("StaticFieldLeak")
 object MeerBot {
@@ -48,32 +57,44 @@ object MeerBot {
     private const val PREF_NAME_ENCRYPTED = "meerbot_sdk_secure"
     private const val KEY_VISITOR_UUID = "visitor_uuid"
     private const val KEY_INSTALLATION_ID = "installation_id"
-    /** Выход, ещё не подтверждённый сервером (см. [ru.meerbot.sdk.network.LogoutFlagStore]). */
-    private const val KEY_PENDING_LOGOUT = "pending_logout"
     private const val TAG = "MeerBot"
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
+    /** Все изменения состояния SDK — через него (см. [MainThreadSerialExecutor]). */
+    private val mainThread by lazy { MainThreadSerialExecutor.forMainLooper() }
+
+    // Пишутся только на главном потоке; @Volatile — для чтения с любого (`identityStatus()`,
+    // `chatController()`, `handlePush`).
+    @Volatile
     private var prefs: SharedPreferences? = null
+
+    @Volatile
     private var configuration: MeerBotConfiguration? = null
+
+    @Volatile
     private var client: ApiClient? = null
+
+    @Volatile
     private var controller: ChatController? = null
+
+    @Volatile
     private var visitorUuid: String? = null
 
+    /** Решает, что значит очередной `identify`: вход, свежий токен, смена человека, выход. */
+    @Volatile
+    private var identity: IdentityCoordinator? = null
+
     /** Токен идентичности, переданный до configure() — применим на первом рукопожатии. */
+    @Volatile
     private var pendingIdentityToken: String? = null
 
     /**
-     * Выход, запрошенный до configure(): хранилища ещё нет, флаг живёт в памяти и пишется в
-     * prefs в configure(), до создания клиента.
+     * Выход, запрошенный до configure() в этом процессе. Дублирует диск ([EarlyLogout]): если
+     * хост вырезал провайдер контекста, в этом процессе сигнал всё равно не потеряется.
      */
+    @Volatile
     private var pendingLogout = false
-
-    /**
-     * Чья identity применена к текущему клиенту: `sub` последнего токена (у нечитаемого —
-     * сама строка). `null` — токена нет или был выход. По нему решается, чистить ли ленту.
-     */
-    private var appliedIdentityKey: String? = null
 
     /**
      * Настроить SDK.
@@ -92,7 +113,12 @@ object MeerBot {
         configure(context, MeerBotConfiguration(apiKey = apiKey, baseUrl = baseUrl))
     }
 
-    /** Настройка целиком объектом конфигурации (тесты и хост-приложения со своим OkHttp). */
+    /**
+     * Настройка целиком объектом конфигурации (тесты и хост-приложения со своим OkHttp).
+     *
+     * Хранилище (Keystore, диск) открывается на потоке вызывающего, сама настройка
+     * применяется на главном — в общей очереди с `identify` и `reset`.
+     */
     @JvmOverloads
     fun configure(
         context: Context,
@@ -101,34 +127,54 @@ object MeerBot {
     ) {
         val appContext = context.applicationContext
         val store = openPrefs(appContext)
+        // Провайдер уже дал контекст при старте процесса; здесь — для хоста, вырезавшего его.
+        EarlyLogout.attach(appContext)
+        mainThread.execute { applyConfiguration(store, configuration, httpClient) }
+    }
+
+    @MainThread
+    private fun applyConfiguration(
+        store: SharedPreferences,
+        configuration: MeerBotConfiguration,
+        httpClient: OkHttpClient,
+    ) {
         prefs = store
-        val uuid = getOrCreate(KEY_VISITOR_UUID) { UUID.randomUUID().toString() }
+        val uuid = getOrCreate(store, KEY_VISITOR_UUID) { UUID.randomUUID().toString() }
         // Идентификатор установки уходит в `deviceToken` рукопожатия и определяет, чей это
         // тред. Он стабилен и не подменяется пуш-токеном: смена значения означала бы для
         // пользователя новую переписку с нуля.
-        val installation = getOrCreate(KEY_INSTALLATION_ID) { "and-" + UUID.randomUUID() }
-        val logoutFlag = PrefsLogoutFlagStore(store)
-        if (pendingLogout) {
-            logoutFlag.pending = true
-            pendingLogout = false
-        }
-        val apiClient = ApiClient(configuration, uuid, installation, httpClient, logoutFlag)
+        val installation = getOrCreate(store, KEY_INSTALLATION_ID) { "and-" + UUID.randomUUID() }
+        val apiClient = ApiClient(configuration, uuid, installation, httpClient, PrefsLogoutFlagStore(store))
+        val chat = ChatController(apiClient, scope)
+        val coordinator = IdentityCoordinator(
+            client = apiClient,
+            installationId = installation,
+            subjects = PrefsSubjectHashStore(store),
+            resetFeed = chat::resetForIdentityChange,
+        )
 
         this.configuration = configuration
         this.visitorUuid = uuid
         this.client = apiClient
-        this.controller = ChatController(apiClient, scope)
+        this.controller = chat
+        this.identity = coordinator
 
         // Рукопожатие здесь СОЗНАТЕЛЬНО не делаем: `/mobile/register` заводит строку
         // устройства, и вызов на старте приложения записал бы «устройство» каждому, кто чат
         // ни разу не открыл, — это перекосило бы аналитику владельца и его лимиты.
         // Кому нужен прогрев — preconnect().
 
-        // Новый клиент создан без токена: ключ прежнего клиента к нему не относится.
-        appliedIdentityKey = IdentitySubject.key(pendingIdentityToken)
+        // Выход до configure — в этом процессе или в прошлом — применяется раньше токена:
+        // `identify(null)`, затем `identify(B)` до настройки дают одно рукопожатие с `logout`
+        // и токеном B, как и после неё.
+        if (pendingLogout || EarlyLogout.isPending()) {
+            coordinator.apply(null)
+            pendingLogout = false
+            EarlyLogout.clear()
+        }
         pendingIdentityToken?.let { token ->
             pendingIdentityToken = null
-            apiClient.setIdentityToken(token)
+            coordinator.apply(token)
         }
     }
 
@@ -162,7 +208,10 @@ object MeerBot {
         }
     }
 
-    /** Контроллер чата — для приложений, которые рисуют свой UI поверх нашего состояния. */
+    /**
+     * Контроллер чата — для приложений, которые рисуют свой UI поверх нашего состояния.
+     * Его методы управления (`start`, `stop`, `send`, …) — только с главного потока.
+     */
     fun chatController(): ChatController? = controller
 
     /**
@@ -170,42 +219,63 @@ object MeerBot {
      * эффект — визитор появится в аналитике владельца, даже если чат так и не откроют.
      */
     fun preconnect() {
-        controller?.start()
+        mainThread.execute { controller?.start() }
     }
 
     /**
-     * Передать подписанный токен идентичности (verified identity).
+     * Передать подписанный токен идентичности (verified identity) или сообщить о выходе.
      *
      * Токен выпускает БЭКЕНД интегратора секретом мобильного приложения (кабинет → Каналы →
      * Мобильные приложения). Пока он не передан, посетитель анонимен: инструменты с доступом
-     * к данным клиента ему недоступны. Вызов до `configure(...)` запоминается и применяется
-     * на первом рукопожатии.
+     * к данным клиента ему недоступны.
      *
-     * Токен уходит в следующее рукопожатие при каждом вызове. Ленту на экране очищает только
-     * токен ДРУГОГО пользователя (другой `sub`): свежий токен того же пользователя, выпущенный
-     * на очередной вход в чат, ленту не трогает.
+     * Что делает вызов, решает `sub` токена (у нечитаемого токена — вся строка) в сравнении с
+     * последним применённым на этой установке. SDK хранит его хеш, поэтому сравнение переживает
+     * перезапуск приложения:
+     * - **тот же пользователь** (свежий токен на очередной вход в чат) — токен уходит в
+     *   следующее рукопожатие, лента не трогается;
+     * - **первый вход** (токена не было или был выход) — токен уходит в рукопожатие, лента
+     *   очищается;
+     * - **другой пользователь без выхода прежнего** — это выход плюс вход: следующее
+     *   рукопожатие несёт `logout: true` и новый токен, диалог, курсор и статус identity
+     *   прежнего сбрасываются, лента очищается. Новый человек не увидит тред прежнего, даже
+     *   если его токен сервер не примет (например, просрочен);
+     * - **`null`** — НАСТОЯЩИЙ выход пользователя из аккаунта, и звать его нужно только тогда,
+     *   а не «на всякий случай» при пустом токене. С 0.2.9 выход отвязывает устройство на
+     *   сервере при следующем подключении: прежний тред остаётся за прежним пользователем,
+     *   новый начинается пустым, а локальная лента очищается сразу. Без выхода сервер держит
+     *   связь устройства с последним вошедшим пользователем. Сервер, не знающий выхода, сигнал
+     *   игнорирует — тогда связь сохраняется, как у SDK 0.2.8 и старше.
      *
-     * `null` — НАСТОЯЩИЙ выход пользователя из аккаунта, и звать его нужно только тогда, а не
-     * «на всякий случай» при пустом токене. С 0.2.9 выход отвязывает устройство на сервере
-     * при следующем подключении: прежний тред остаётся за прежним пользователем, новый
-     * начинается пустым, а локальная лента очищается сразу. Сигнал переживает перезапуск
-     * приложения и работает до `configure(...)`. Без вызова `identify(null)` сервер держит
-     * связь устройства с последним вошедшим пользователем. Сервер, не знающий выхода,
-     * сигнал игнорирует — тогда связь сохраняется, как у SDK 0.2.8 и старше.
+     * Потоки: звать можно с любого. Вызовы применяются на главном потоке строго в порядке
+     * вызова (вместе с `configure`, `reset`, `preconnect`): `identify(null)` и следом
+     * `identify(B)` с фонового потока придут именно так. С фонового потока действие
+     * асинхронно — к возврату из метода оно может быть ещё не применено.
+     *
+     * До `configure(...)` вызов запоминается и применяется при настройке. Выход к тому же сразу
+     * пишется на диск (контекст приложения SDK получает при старте процесса своим
+     * ContentProvider) и переживает перезапуск, даже если `configure` в этом процессе так и не
+     * позовут. Если хост вырезал провайдер из манифеста, выход до `configure` живёт только в
+     * памяти процесса.
      */
     fun identify(token: String?) {
-        val apiClient = client
-        if (apiClient == null) {
-            if (token == null) pendingLogout = true
+        mainThread.execute { applyIdentity(token) }
+    }
+
+    @MainThread
+    private fun applyIdentity(token: String?) {
+        val coordinator = identity
+        if (coordinator == null) {
+            if (token == null) {
+                pendingLogout = true
+                if (!EarlyLogout.markPending()) {
+                    Log.w(TAG, "logout_not_persisted: выход до configure() без контекста приложения останется только в памяти процесса")
+                }
+            }
             pendingIdentityToken = token
             return
         }
-        // Выход чистит ленту всегда (связь могла остаться от прошлого запуска), токен — только
-        // при смене человека. Решение и его причины — IdentitySubject.shouldResetFeed.
-        val resetFeed = IdentitySubject.shouldResetFeed(appliedIdentityKey, token)
-        appliedIdentityKey = IdentitySubject.key(token)
-        if (token == null) apiClient.logout() else apiClient.setIdentityToken(token)
-        if (resetFeed) controller?.resetForIdentityChange()
+        coordinator.apply(token)
     }
 
     /** Что сервер сделал с identity на последнем рукопожатии. */
@@ -248,41 +318,32 @@ object MeerBot {
 
     /**
      * Сбросить состояние SDK (GDPR Art. 17 на стороне клиента): идентификатор установки,
-     * визитор, лента и токены. Серверные данные мобильного канала удаляются по обращению
-     * в поддержку — своего эндпоинта у канала пока нет.
+     * визитор, лента, токены и неотправленный выход. Серверные данные мобильного канала
+     * удаляются по обращению в поддержку — своего эндпоинта у канала пока нет.
      *
      * ⚠️ После сброса устройство для сервера новое: прежняя переписка останется на старом
      * идентификаторе установки и в приложении больше не покажется.
      */
     fun reset() {
+        mainThread.execute { applyReset() }
+    }
+
+    @MainThread
+    private fun applyReset() {
         controller?.stop()
         controller?.store?.resetForLogout()
         client = null
         controller = null
+        identity = null
         configuration = null
         visitorUuid = null
         pendingIdentityToken = null
         pendingLogout = false
-        appliedIdentityKey = null
         prefs?.edit()?.clear()?.apply()
+        EarlyLogout.clear()
     }
 
     // ─── Внутреннее ───────────────────────────────────────────────────────────────────────
-
-    /**
-     * Флаг выхода в prefs SDK. `commit()`, а не `apply()`: `apply()` пишет на диск позже, и
-     * процесс, убитый сразу после выхода, потерял бы сигнал — устройство осталось бы за прежним
-     * пользователем. Запись редкая (выход и его подтверждение), цена синхронной записи мала.
-     */
-    private class PrefsLogoutFlagStore(private val prefs: SharedPreferences) : LogoutFlagStore {
-        override var pending: Boolean
-            get() = prefs.getBoolean(KEY_PENDING_LOGOUT, false)
-            set(value) {
-                if (!prefs.edit().putBoolean(KEY_PENDING_LOGOUT, value).commit()) {
-                    Log.w(TAG, "не удалось сохранить флаг выхода (pending=$value)")
-                }
-            }
-    }
 
     /**
      * Зашифрованные prefs с миграцией из старых открытых.
@@ -321,16 +382,15 @@ object MeerBot {
      * Прочитать сохранённое значение или создать новое. `visitorUuid` сервер валидирует
      * ровно по длине 36, поэтому мусор из старых версий отбрасывается.
      */
-    private fun getOrCreate(key: String, create: () -> String): String {
-        val store = prefs
-        val existing = store?.getString(key, null)
+    private fun getOrCreate(store: SharedPreferences, key: String, create: () -> String): String {
+        val existing = store.getString(key, null)
         if (!existing.isNullOrEmpty() &&
             (key != KEY_VISITOR_UUID || existing.length == 36)
         ) {
             return existing
         }
         val fresh = create()
-        store?.edit()?.putString(key, fresh)?.apply()
+        store.edit().putString(key, fresh).apply()
         return fresh
     }
 }

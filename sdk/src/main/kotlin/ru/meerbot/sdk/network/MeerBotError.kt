@@ -36,6 +36,10 @@ sealed class MeerBotError(message: String) : Exception(message) {
         private fun readResolve(): Any = InvalidResponse
     }
 
+    /**
+     * Рукопожатие перебито сменой пользователя. Для экрана безобидно, только если сменилась и
+     * эпоха контроллера; иначе (попытки исчерпаны без смены человека) — провал отправки.
+     */
     object Cancelled : MeerBotError("Отменено") {
         private fun readResolve(): Any = Cancelled
     }
@@ -74,6 +78,9 @@ sealed class MeerBotError(message: String) : Exception(message) {
                     R.string.meerbot_err_rate_limited
                 errorCode == "message_too_long" -> R.string.meerbot_err_message_too_long
                 errorCode == "identity_required" -> R.string.meerbot_err_identity_required
+                // До экрана такая ошибка доходит, только когда переподключение уже было и не
+                // помогло (SDK повторяет его сам, один раз). «Переподключаемся…» здесь — неправда.
+                isExpiredToken -> R.string.meerbot_err_session_lost
                 status == 401 -> R.string.meerbot_err_session_expired
                 else -> R.string.meerbot_err_server
             }
