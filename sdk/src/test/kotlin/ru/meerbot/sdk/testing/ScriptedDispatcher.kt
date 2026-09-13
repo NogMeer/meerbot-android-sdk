@@ -20,8 +20,10 @@ class ScriptedDispatcher : Dispatcher() {
 
     private val registerSteps = ConcurrentLinkedQueue<Step>()
     private val historySteps = ConcurrentLinkedQueue<Step>()
+    private val streamSteps = ConcurrentLinkedQueue<Step>()
     private val registerArrivals = LinkedBlockingQueue<RecordedRequest>()
     private val historyArrivals = LinkedBlockingQueue<RecordedRequest>()
+    private val streamArrivals = LinkedBlockingQueue<RecordedRequest>()
 
     /** Ответ рукопожатия, когда сценарий исчерпан. */
     @Volatile
@@ -35,8 +37,18 @@ class ScriptedDispatcher : Dispatcher() {
     fun gateNextRegister(response: MockResponse = register()): CountDownLatch =
         CountDownLatch(1).also { registerSteps.add(Step(response, it)) }
 
+    /** Ответ потока `/mobile/chat/stream`, когда сценарий исчерпан. */
+    @Volatile
+    var streamFallback: () -> MockResponse = { MockResponse().setResponseCode(404) }
+
     fun gateNextHistory(response: MockResponse): CountDownLatch =
         CountDownLatch(1).also { historySteps.add(Step(response, it)) }
+
+    fun gateNextStream(response: MockResponse): CountDownLatch =
+        CountDownLatch(1).also { streamSteps.add(Step(response, it)) }
+
+    fun awaitStream(): RecordedRequest =
+        streamArrivals.poll(5, TimeUnit.SECONDS) ?: failWith("запрос потока не пришёл")
 
     fun awaitRegister(): RecordedRequest =
         registerArrivals.poll(5, TimeUnit.SECONDS) ?: failWith("рукопожатие не пришло")
@@ -47,6 +59,7 @@ class ScriptedDispatcher : Dispatcher() {
     fun clearArrivals() {
         registerArrivals.clear()
         historyArrivals.clear()
+        streamArrivals.clear()
     }
 
     override fun dispatch(request: RecordedRequest): MockResponse {
@@ -56,6 +69,8 @@ class ScriptedDispatcher : Dispatcher() {
                 respond(request, registerArrivals, registerSteps, registerFallback)
             path.startsWith("/api/v1/mobile/messages") ->
                 respond(request, historyArrivals, historySteps, historyFallback)
+            path.startsWith("/api/v1/mobile/chat/stream") ->
+                respond(request, streamArrivals, streamSteps, streamFallback)
             else -> MockResponse().setResponseCode(404)
         }
     }
@@ -85,6 +100,10 @@ class ScriptedDispatcher : Dispatcher() {
         fun history(mode: String = "ai", messages: String = "") = MockResponse().setBody(
             """{"messages":[$messages],"hasMore":false,"mode":"$mode"}""",
         )
+
+        fun sse(body: String) = MockResponse()
+            .setHeader("Content-Type", "text/event-stream")
+            .setBody(body)
 
         fun error(status: Int, code: String) = MockResponse()
             .setResponseCode(status)

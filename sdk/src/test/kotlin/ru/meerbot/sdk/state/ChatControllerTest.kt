@@ -441,6 +441,133 @@ class ChatControllerTest {
         assertTrue(!state.sending)
     }
 
+    // ─── Отправка до прихода стартовой истории ────────────────────────────────────────────
+
+    /** Прошлый тред: стартовая история приносит его целиком. */
+    private val earlierThread =
+        """{"id":5,"role":"user","content":"старый вопрос","createdAt":"2026-08-14T10:00:00.000Z"},
+           {"id":6,"role":"assistant","content":"старый ответ","createdAt":"2026-08-14T10:00:01.000Z"}"""
+
+    /** Догон после отправки: сервер отдаёт то же сообщение и ответ уже со своими id. */
+    private val echoPage =
+        """{"id":7,"role":"user","content":"привет","createdAt":"2026-09-13T10:00:00.000Z"},
+           {"id":8,"role":"assistant","content":"Здравствуйте","createdAt":"2026-09-13T10:00:01.000Z"}"""
+
+    private val answerStream =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Здравствуйте\"}}]}\n\ndata: [DONE]\n\n"
+
+    /**
+     * Человек открыл чат и сразу написал, а стартовая история ещё в пути. Порядок задан
+     * воротами: история долетела до сервера → отправка ушла → история отпущена, пока сообщение
+     * ещё отправляется. До правки история заменяла ленту целиком, и сообщение пропадало с экрана.
+     */
+    @Test
+    fun `сообщение, отправленное до прихода истории, не пропадает и не двоится после эха`() {
+        val dispatcher = ScriptedDispatcher().also { server.dispatcher = it }
+        val historyGate = dispatcher.gateNextHistory(ScriptedDispatcher.history(messages = earlierThread))
+        val streamGate = dispatcher.gateNextStream(ScriptedDispatcher.sse(answerStream))
+        val controller = controller()
+
+        controller.start()
+        dispatcher.awaitHistory()
+        controller.send("привет")
+        dispatcher.awaitStream()
+        historyGate.countDown()
+        await(controller) { it.ready }
+
+        val applied = controller.state.value
+        assertTrue(applied.sending)
+        assertEquals(listOf("старый вопрос", "старый ответ", "привет", ""), applied.messages.map { it.content })
+        val local = applied.messages[2]
+        assertNull(local.serverId)
+        assertTrue(applied.messages[3].streaming)
+
+        dispatcher.historyFallback = { ScriptedDispatcher.history(messages = echoPage) }
+        streamGate.countDown()
+        await(controller) { s -> !s.sending && s.messages.any { it.serverId == 8L } }
+
+        val state = controller.state.value
+        assertEquals(listOf("старый вопрос", "старый ответ", "привет", "Здравствуйте"), state.messages.map { it.content })
+        assertEquals(listOf(5L, 6L, 7L, 8L), state.messages.map { it.serverId })
+        assertEquals(local.id, state.messages[2].id)
+        assertEquals(8L, state.lastServerMessageId)
+    }
+
+    /** Недоставленное сообщение с «Повторить» переживает стартовую историю и повтор не двоит его. */
+    @Test
+    fun `недоставленное до прихода истории сообщение остаётся с повтором`() {
+        val dispatcher = ScriptedDispatcher().also { server.dispatcher = it }
+        val historyGate = dispatcher.gateNextHistory(ScriptedDispatcher.history(messages = earlierThread))
+        dispatcher.streamFallback = { ScriptedDispatcher.error(500, "internal") }
+        val controller = controller()
+
+        controller.start()
+        dispatcher.awaitHistory()
+        controller.send("привет")
+        await(controller) { it.retryable != null }
+        historyGate.countDown()
+        await(controller) { it.ready }
+
+        val applied = controller.state.value
+        assertEquals(listOf("старый вопрос", "старый ответ", "привет"), applied.messages.map { it.content })
+        assertTrue(applied.messages.last().failed)
+        assertNull(applied.messages.last().serverId)
+        assertEquals("привет", applied.retryable)
+
+        dispatcher.streamFallback = { ScriptedDispatcher.sse(answerStream) }
+        dispatcher.historyFallback = { ScriptedDispatcher.history(messages = echoPage) }
+        controller.retry()
+        await(controller) { s -> !s.sending && s.messages.any { it.serverId == 8L } }
+
+        val state = controller.state.value
+        assertEquals(listOf("старый вопрос", "старый ответ", "привет", "Здравствуйте"), state.messages.map { it.content })
+        assertTrue(state.messages.none { it.failed })
+        assertNull(state.retryable)
+    }
+
+    /**
+     * Поток оборвался, а хвост треда заканчивается СТАРЫМ ответом — эха сообщения в нём нет,
+     * сервер его не получил. Раньше такая лента заменяла текущую, и сообщение пропадало без
+     * «Повторить».
+     */
+    @Test
+    fun `обрыв с хвостом без эха оставляет сообщение недоставленным`() {
+        val controller = started()
+        server.enqueue(
+            sse("data: {\"choices\":[{\"delta\":{\"content\":\"нача\"}}]}\n\n")
+                .setSocketPolicy(SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY)
+        )
+        server.enqueue(history(messages = earlierThread))
+
+        controller.send("привет")
+
+        await(controller) { it.retryable != null }
+        val state = controller.state.value
+        assertEquals(listOf("старый вопрос", "старый ответ", "привет"), state.messages.map { it.content })
+        assertTrue(state.messages.last().failed)
+        assertEquals("привет", state.retryable)
+    }
+
+    /** Смена пользователя по-прежнему уносит и то, что ещё отправляется. */
+    @Test
+    fun `смена пользователя убирает и неотправленное сообщение`() {
+        val dispatcher = ScriptedDispatcher().also { server.dispatcher = it }
+        val controller = controller()
+        controller.start()
+        await(controller) { it.ready }
+        val streamGate = dispatcher.gateNextStream(ScriptedDispatcher.sse(answerStream))
+        controller.send("мой номер заказа 123")
+        dispatcher.awaitStream()
+
+        controller.resetForIdentityChange()
+
+        assertTrue(controller.state.value.messages.isEmpty())
+        assertTrue(!controller.state.value.sending)
+        streamGate.countDown()
+        await(controller) { it.ready }
+        assertTrue(controller.state.value.messages.isEmpty())
+    }
+
     @Test
     fun `heartbeat снимает баннер прошлой ошибки`() {
         val controller = started()

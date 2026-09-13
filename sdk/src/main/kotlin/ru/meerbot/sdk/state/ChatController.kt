@@ -360,7 +360,7 @@ class ChatController(
                 // Плановый рестарт сервера — не сетевой сбой. Ответ уже могли дописать в БД.
                 store.finalizeAssistant(placeholderId)
                 store.setSending(false)
-                scope.launch { runCatching { loadHistory() } }
+                scope.launch { runCatching { loadHistory(brokenAnswerId = placeholderId) } }
             }
 
             is ChatStreamEvent.Unknown -> Unit
@@ -398,29 +398,38 @@ class ChatController(
         }
 
         // Ответ мог быть дописан сервером, пока рвалось соединение. Серверную ленту
-        // принимаем ТОЛЬКО если она заканчивается ответом: иначе замена выбросила бы из UI
-        // недоставленное сообщение пользователя.
+        // принимаем, только если она заканчивается ответом: тогда обрывок уступает ему место.
         val items = runCatching { fetchHistory() }.getOrNull()
         // Пользователь сменился, пока шёл запрос: его новой ленте чужой «Повторить» не нужен.
         if (identityEpoch.get() != startedEpoch) return
         if (items != null && items.lastOrNull()?.role == "assistant") {
-            store.replaceAll(items)
-            return
+            store.mergeServerSnapshot(items, supersededLocalId = placeholderId)
+            // Эхо сообщения пришло — сервер его получил. Нет эха — ответ в хвосте старый,
+            // сообщение не дошло и остаётся недоставленным (раньше замена ленты его стирала).
+            if (store.messages.none { it.id == userMessageId && it.serverId == null }) return
         }
 
         store.setFailed(userMessageId, true)
         store.setRetryable(text)
     }
 
-    /** Догон истории: сервер — источник правды, локальную ленту заменяем целиком. */
-    private suspend fun loadHistory() {
+    /**
+     * Хвост треда: серверные строки — источник правды, но сообщения, которые ещё отправляются
+     * или ждут «Повторить», остаются (см. [ChatStore.mergeServerSnapshot]). Человек мог написать,
+     * пока стартовая история была в пути, — раньше она заменяла ленту и сообщение пропадало.
+     *
+     * @param brokenAnswerId обрывок ответа (плановый рестарт сервера посреди потока). Если хвост
+     *   заканчивается ответом, сервер его дописал — обрывок уходит, иначе встал бы рядом.
+     */
+    private suspend fun loadHistory(brokenAnswerId: String? = null) {
         val items = fetchHistory() ?: return
         if (items.isEmpty()) return
-        store.replaceAll(items)
+        val superseded = brokenAnswerId?.takeIf { items.last().role == "assistant" }
+        store.mergeServerSnapshot(items, supersededLocalId = superseded)
     }
 
     /**
-     * Хвост треда с сервера (без курсора) — для полной замены ленты при старте и после обрыва.
+     * Хвост треда с сервера (без курсора) — для слияния с лентой при старте и после обрыва.
      * `null` — пока шёл запрос, сменился пользователь, и страница принадлежит прежнему.
      */
     private suspend fun fetchHistory(): List<ChatMessage>? {

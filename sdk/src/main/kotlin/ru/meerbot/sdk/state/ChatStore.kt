@@ -190,19 +190,9 @@ class ChatStore {
             val merged = current.messages.toMutableList()
             for (item in items) {
                 if (item.serverId != null && merged.any { it.serverId == item.serverId }) continue
-                // Сравнение по ПОДРЕЗАННОМУ тексту: сервер хранит ответ без крайних пробелов,
-                // а в потоке они приходят (первым чанком часто идёт перевод строки). Точное
-                // равенство роняло слияние в дубль ровно на таких ответах.
-                val localIdx = merged.indexOfLast {
-                    it.serverId == null && it.role == item.role &&
-                        it.content.trim() == item.content.trim()
-                }
+                val localIdx = indexOfLocalTwin(merged, item)
                 if (localIdx >= 0) {
-                    merged[localIdx] = merged[localIdx].copy(
-                        serverId = item.serverId,
-                        failed = false,
-                        streaming = false,
-                    )
+                    merged[localIdx] = promoted(merged[localIdx], item)
                     continue
                 }
                 merged += item
@@ -215,6 +205,90 @@ class ChatStore {
         }
         return added
     }
+
+    /**
+     * Применить хвост треда с сервера (старт экрана, обрыв потока, плановый рестарт сервера).
+     *
+     * Серверные строки — источник правды, но ЛОКАЛЬНЫЕ (ещё без `serverId`) не выбрасываются:
+     * сообщение, отправленное до прихода стартовой истории, ещё отправляется или ждёт
+     * «Повторить», а снимок, запрошенный раньше отправки, о нём не знает. Раньше здесь была
+     * замена ленты целиком, и такое сообщение пропадало с экрана.
+     *
+     * Дедупликация — то же правило, что у [mergeServerMessages]: строка снимка с локальным
+     * двойником промоутит его (id пузыря сохраняется, дубля нет). Одно ограничение сверху:
+     * двойником бывает только строка НОВЕЕ курсора. Всё, что не новее, лента уже видела, и
+     * совпадение текста со старой строкой («привет» вчера и «привет» сегодня) — не эхо. Догону
+     * это ограничение не нужно: его страница по построению новее курсора.
+     *
+     * Непромоутированная локальная строка встаёт сразу за серверной строкой, за которой стояла
+     * в ленте (догон тоже кладёт новое после неё), не было такой в снимке — перед ближайшей
+     * следующей, нет и её — в конец.
+     *
+     * @param supersededLocalId локальная строка, которую снимок заменяет по смыслу, а не по
+     *   тексту: обрывок ответа, дописанного сервером целиком. Убирается в том же обновлении
+     *   состояния, чтобы экран не увидел кадр без ответа вовсе.
+     */
+    internal fun mergeServerSnapshot(items: List<ChatMessage>, supersededLocalId: String? = null) =
+        _state.update { current ->
+            val feed = current.messages.filterNot { it.id == supersededLocalId }
+            val snapshot = items.toMutableList()
+            val candidates = feed.filter { it.serverId == null }.toMutableList()
+            val promotedIds = HashSet<String>()
+            // С конца: последнее эхо достаётся последнему двойнику, порядок пузырей сохраняется.
+            for (i in snapshot.indices.reversed()) {
+                val item = snapshot[i]
+                val serverId = item.serverId ?: continue
+                if (serverId <= current.lastServerMessageId) continue
+                val idx = indexOfLocalTwin(candidates, item)
+                if (idx < 0) continue
+                val local = candidates.removeAt(idx)
+                snapshot[i] = promoted(local, item)
+                promotedIds += local.id
+            }
+
+            val slotByServerId = HashMap<Long, Int>()
+            val slotByLocalId = HashMap<String, Int>()
+            snapshot.forEachIndexed { slot, m ->
+                m.serverId?.let { slotByServerId[it] = slot }
+                if (m.id in promotedIds) slotByLocalId[m.id] = slot
+            }
+            fun slotOf(m: ChatMessage): Int? =
+                m.serverId?.let { slotByServerId[it] } ?: slotByLocalId[m.id]
+
+            val pendingBySlot = HashMap<Int, MutableList<ChatMessage>>()
+            feed.forEachIndexed { pos, m ->
+                if (m.serverId != null || m.id in promotedIds) return@forEachIndexed
+                val slot = (pos - 1 downTo 0).firstNotNullOfOrNull { slotOf(feed[it]) }?.plus(1)
+                    ?: (pos + 1 until feed.size).firstNotNullOfOrNull { slotOf(feed[it]) }
+                    ?: snapshot.size
+                pendingBySlot.getOrPut(slot) { mutableListOf() } += m
+            }
+
+            val merged = ArrayList<ChatMessage>(snapshot.size + candidates.size)
+            for (slot in 0..snapshot.size) {
+                pendingBySlot[slot]?.let { merged += it }
+                if (slot < snapshot.size) merged += snapshot[slot]
+            }
+            current.copy(
+                messages = merged,
+                lastServerMessageId = bumpCursor(current.lastServerMessageId, items),
+            )
+        }
+
+    /**
+     * Локальный двойник серверной строки: тот же `role` и текст, ещё без серверного id.
+     *
+     * Сравнение по ПОДРЕЗАННОМУ тексту: сервер хранит ответ без крайних пробелов, а в потоке
+     * они приходят (первым чанком часто идёт перевод строки). Точное равенство роняло слияние
+     * в дубль ровно на таких ответах.
+     */
+    private fun indexOfLocalTwin(messages: List<ChatMessage>, item: ChatMessage): Int =
+        messages.indexOfLast {
+            it.serverId == null && it.role == item.role && it.content.trim() == item.content.trim()
+        }
+
+    private fun promoted(local: ChatMessage, item: ChatMessage): ChatMessage =
+        local.copy(serverId = item.serverId, failed = false, streaming = false)
 
     /** Курсор только растёт: страница старее текущего значения не имеет права его откатить. */
     private fun bumpCursor(current: Long, items: List<ChatMessage>): Long =
