@@ -337,7 +337,11 @@ class ChatControllerTest {
 
         controller.send("привет")
 
-        await(controller) { it.messages.any { m -> m.content == "ответ дописан" } }
+        // Ждём итог сверки, а не появление серверного ответа: слияние истории и уборка
+        // недописанного пузыря («нача») — два шага, и между ними в ленте три строки.
+        await(controller) { s ->
+            s.messages.any { it.content == "ответ дописан" } && s.messages.none { it.content == "нача" }
+        }
         val state = controller.state.value
         assertEquals(2, state.messages.size)
         assertTrue(state.messages.none { it.failed })
