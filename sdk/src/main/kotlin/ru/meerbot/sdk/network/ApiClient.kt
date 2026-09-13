@@ -55,6 +55,24 @@ data class HistoryMessage(
 )
 
 /**
+ * Где лежит сигнал «пользователь вышел», пока сервер его не подтвердил.
+ *
+ * Регистрация ленивая (первое открытие чата), а между `identify(null)` и ней процесс могут
+ * убить. Потерянный сигнал оставил бы устройство привязанным к прежнему пользователю, и
+ * следующий человек на телефоне увидел бы чужую переписку, — поэтому SDK хранит флаг в
+ * prefs, а в тестах хватает памяти.
+ */
+interface LogoutFlagStore {
+    var pending: Boolean
+}
+
+/** Флаг в памяти процесса: для тестов и хостов, собирающих [ApiClient] сами. */
+class InMemoryLogoutFlagStore(pending: Boolean = false) : LogoutFlagStore {
+    @Volatile
+    override var pending: Boolean = pending
+}
+
+/**
  * Клиент канала `mobile_app`: держит JWT, обновляет его по истечении и стримит ответы.
  *
  * Потокобезопасен: рукопожатие сериализовано мьютексом, поэтому параллельные отправки не
@@ -74,9 +92,24 @@ class ApiClient(
      */
     private val installationId: String,
     private val httpClient: OkHttpClient = defaultHttpClient(),
+    /** Сигнал выхода, не подтверждённый сервером. Переживает процесс, если хранилище это умеет. */
+    private val logoutFlag: LogoutFlagStore = InMemoryLogoutFlagStore(),
 ) {
 
     private val tokenMutex = Mutex()
+
+    /**
+     * Защищает связку «поколение identity ↔ сохранённая сессия». Мьютекс рукопожатия здесь не
+     * годится: `logout()`/`setIdentityToken()` не suspend и зовутся с главного потока.
+     */
+    private val sessionLock = Any()
+
+    /**
+     * Поколение identity: растёт на каждой смене токена и на выходе. Рукопожатие, начатое в
+     * прежнем поколении, своей сессии не сохраняет — иначе JWT, выписанный на привязанное
+     * устройство прежнего пользователя, пережил бы выход и открыл бы его ленту.
+     */
+    private var generation = 0
 
     @Volatile
     private var jwt: String? = null
@@ -111,13 +144,43 @@ class ApiClient(
     var identityStatus: IdentityStatus = IdentityStatus.NotProvided
         private set
 
+    /** Токен идентичности, с которым уйдёт следующее рукопожатие. */
+    internal val currentIdentityToken: String? get() = identityToken
+
     /**
      * Подписанный бэкендом интегратора токен идентичности. Следующее рукопожатие уйдёт с ним;
      * текущая сессия сбрасывается, иначе identity подхватилась бы только через 15 минут.
+     *
+     * `null` здесь — только «токена нет», устройство от пользователя НЕ отвязывается: сервер
+     * держит связь, пока не придёт явный выход. Выход — [logout].
      */
     fun setIdentityToken(token: String?) {
-        identityToken = token
-        invalidateToken()
+        synchronized(sessionLock) {
+            identityToken = token
+            generation++
+            invalidateToken()
+        }
+    }
+
+    /**
+     * Выход пользователя. Следующее рукопожатие несёт `logout: true`, и сервер (с 0.2.9 SDK)
+     * уводит привязанное устройство в отставку: прежний тред остаётся прежнему пользователю,
+     * новый начинается пустым.
+     *
+     * Флаг ставится ПЕРВЫМ и снимается только ответом, в котором сервер сообщил `unlinked`:
+     * старый сервер поле `logout` игнорирует, и сигнал уходит снова на каждом рукопожатии,
+     * пока сервер не обновят. Для устройства без связи повтор ничего не меняет.
+     */
+    fun logout() {
+        synchronized(sessionLock) {
+            logoutFlag.pending = true
+            identityToken = null
+            generation++
+            invalidateToken()
+            conversationId = null
+            lastMessageId = null
+            identityStatus = IdentityStatus.NotProvided
+        }
     }
 
     // ─── Рукопожатие ──────────────────────────────────────────────────────────────────────
@@ -125,37 +188,64 @@ class ApiClient(
     suspend fun openSession(): MobileSession = tokenMutex.withLock { openSessionLocked() }
 
     private suspend fun openSessionLocked(): MobileSession {
-        val body = JSONObject()
-            .put("key", config.apiKey)
-            .put("deviceToken", installationId)
-            .put("platform", "android")
-            .put("visitorUuid", visitorUuid)
-            .put("sdkVersion", config.sdkVersion)
-        identityToken?.let { body.put("identityToken", it) }
+        // Поколение сменилось посреди запроса — ответ принадлежит прежней identity и
+        // отбрасывается. Повторов конечное число: хост, дёргающий identify() в цикле, не
+        // должен превратить рукопожатие в бесконечное.
+        repeat(MAX_REGISTER_ATTEMPTS) {
+            val startedIn: Int
+            val token: String?
+            val logoutSent: Boolean
+            synchronized(sessionLock) {
+                startedIn = generation
+                token = identityToken
+                logoutSent = logoutFlag.pending
+            }
 
-        val request = newRequest("/api/v1/mobile/register")
-            .post(body.toString().toRequestBody(JSON))
-            .build()
+            val body = JSONObject()
+                .put("key", config.apiKey)
+                .put("deviceToken", installationId)
+                .put("platform", "android")
+                .put("visitorUuid", visitorUuid)
+                .put("sdkVersion", config.sdkVersion)
+            token?.let { body.put("identityToken", it) }
+            if (logoutSent) body.put("logout", true)
 
-        val json = executeJson(request)
-        val token = json.optStringOrNull("jwt") ?: throw MeerBotError.InvalidResponse
-        val deviceId = json.optStringOrNull("deviceId") ?: throw MeerBotError.InvalidResponse
-        val expiresIn = json.optInt("expiresIn", 0)
-        if (expiresIn <= 0) throw MeerBotError.InvalidResponse
+            val request = newRequest("/api/v1/mobile/register")
+                .post(body.toString().toRequestBody(JSON))
+                .build()
 
-        jwt = token
-        jwtExpiresAtMs = System.currentTimeMillis() + expiresIn * 1000L
+            val json = executeJson(request)
+            val jwtValue = json.optStringOrNull("jwt") ?: throw MeerBotError.InvalidResponse
+            val deviceId = json.optStringOrNull("deviceId") ?: throw MeerBotError.InvalidResponse
+            val expiresIn = json.optInt("expiresIn", 0)
+            if (expiresIn <= 0) throw MeerBotError.InvalidResponse
 
-        val status = IdentityStatus.from(json.optJSONObject("identity")?.optStringOrNull("status"))
-        identityStatus = status
+            val identity = json.optJSONObject("identity")
+            val status = IdentityStatus.from(identity?.optStringOrNull("status"))
 
-        return MobileSession(
-            deviceId = deviceId,
-            jwt = token,
-            expiresIn = expiresIn,
-            attestationRequired = json.optBoolean("attestationRequired", false),
-            identityStatus = status,
-        )
+            val committed = synchronized(sessionLock) {
+                if (generation != startedIn) return@synchronized false
+                jwt = jwtValue
+                jwtExpiresAtMs = System.currentTimeMillis() + expiresIn * 1000L
+                identityStatus = status
+                // Наличие поля, а не его значение: `unlinked = false` — выход принят, но
+                // отвязывать было нечего. Поля нет — сервер старый и выход не понял.
+                if (logoutSent && identity?.has("unlinked") == true) logoutFlag.pending = false
+                true
+            }
+            if (!committed) return@repeat
+
+            return MobileSession(
+                deviceId = deviceId,
+                jwt = jwtValue,
+                expiresIn = expiresIn,
+                attestationRequired = json.optBoolean("attestationRequired", false),
+                identityStatus = status,
+            )
+        }
+        // Отмена, а не сетевая ошибка: сессию отменила смена пользователя, и её вызывающая
+        // сторона (контроллер) к этому моменту уже перезапущена.
+        throw MeerBotError.Cancelled
     }
 
     /**
@@ -350,6 +440,8 @@ class ApiClient(
     companion object {
         private val JSON = "application/json; charset=utf-8".toMediaType()
         private const val TOKEN_MIN_LIFETIME_MS = 60_000L
+        /** Первая попытка рукопожатия и до двух повторов после смены identity в полёте. */
+        private const val MAX_REGISTER_ATTEMPTS = 3
         private const val STREAM_READ_TIMEOUT_S = 60L
 
         fun defaultHttpClient(): OkHttpClient = OkHttpClient.Builder()

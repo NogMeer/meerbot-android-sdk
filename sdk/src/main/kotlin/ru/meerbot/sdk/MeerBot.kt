@@ -15,6 +15,7 @@ import kotlinx.coroutines.SupervisorJob
 import okhttp3.OkHttpClient
 import ru.meerbot.sdk.network.ApiClient
 import ru.meerbot.sdk.network.IdentityStatus
+import ru.meerbot.sdk.network.LogoutFlagStore
 import ru.meerbot.sdk.network.MeerBotConfiguration
 import ru.meerbot.sdk.state.ChatController
 import ru.meerbot.sdk.ui.NotConfiguredScreen
@@ -46,6 +47,8 @@ object MeerBot {
     private const val PREF_NAME_ENCRYPTED = "meerbot_sdk_secure"
     private const val KEY_VISITOR_UUID = "visitor_uuid"
     private const val KEY_INSTALLATION_ID = "installation_id"
+    /** Выход, ещё не подтверждённый сервером (см. [ru.meerbot.sdk.network.LogoutFlagStore]). */
+    private const val KEY_PENDING_LOGOUT = "pending_logout"
     private const val TAG = "MeerBot"
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -58,6 +61,12 @@ object MeerBot {
 
     /** Токен идентичности, переданный до configure() — применим на первом рукопожатии. */
     private var pendingIdentityToken: String? = null
+
+    /**
+     * Выход, запрошенный до configure(): хранилища ещё нет, флаг живёт в памяти и пишется в
+     * prefs в configure(), до создания клиента.
+     */
+    private var pendingLogout = false
 
     /**
      * Настроить SDK.
@@ -84,13 +93,19 @@ object MeerBot {
         httpClient: OkHttpClient = ApiClient.defaultHttpClient(),
     ) {
         val appContext = context.applicationContext
-        prefs = openPrefs(appContext)
+        val store = openPrefs(appContext)
+        prefs = store
         val uuid = getOrCreate(KEY_VISITOR_UUID) { UUID.randomUUID().toString() }
         // Идентификатор установки уходит в `deviceToken` рукопожатия и определяет, чей это
         // тред. Он стабилен и не подменяется пуш-токеном: смена значения означала бы для
         // пользователя новую переписку с нуля.
         val installation = getOrCreate(KEY_INSTALLATION_ID) { "and-" + UUID.randomUUID() }
-        val apiClient = ApiClient(configuration, uuid, installation, httpClient)
+        val logoutFlag = PrefsLogoutFlagStore(store)
+        if (pendingLogout) {
+            logoutFlag.pending = true
+            pendingLogout = false
+        }
+        val apiClient = ApiClient(configuration, uuid, installation, httpClient, logoutFlag)
 
         this.configuration = configuration
         this.visitorUuid = uuid
@@ -157,15 +172,34 @@ object MeerBot {
      * к данным клиента ему недоступны. Вызов до `configure(...)` запоминается и применяется
      * на первом рукопожатии.
      *
-     * `null` — выход пользователя: следующая сессия будет анонимной.
+     * Смена токена на другой очищает ленту на экране: она подтянется с сервера уже под новой
+     * identity. Повторный вызов с тем же токеном ничего не делает.
+     *
+     * `null` — НАСТОЯЩИЙ выход пользователя из аккаунта, и звать его нужно только тогда, а не
+     * «на всякий случай» при пустом токене. С 0.2.9 выход отвязывает устройство на сервере
+     * при следующем подключении: прежний тред остаётся за прежним пользователем, новый
+     * начинается пустым, а локальная лента очищается сразу. Сигнал переживает перезапуск
+     * приложения и работает до `configure(...)`. Без вызова `identify(null)` сервер держит
+     * связь устройства с последним вошедшим пользователем. Сервер, не знающий выхода,
+     * сигнал игнорирует — тогда связь сохраняется, как у SDK 0.2.8 и старше.
      */
     fun identify(token: String?) {
         val apiClient = client
         if (apiClient == null) {
+            if (token == null) pendingLogout = true
             pendingIdentityToken = token
             return
         }
+        if (token == null) {
+            // Выход — всегда, даже если токена в этом процессе не было: связь могла остаться
+            // от прошлого запуска, и живая сессия открыла бы переписку прежнего пользователя.
+            apiClient.logout()
+            controller?.resetForIdentityChange()
+            return
+        }
+        if (token == apiClient.currentIdentityToken) return
         apiClient.setIdentityToken(token)
+        controller?.resetForIdentityChange()
     }
 
     /** Что сервер сделал с identity на последнем рукопожатии. */
@@ -222,10 +256,26 @@ object MeerBot {
         configuration = null
         visitorUuid = null
         pendingIdentityToken = null
+        pendingLogout = false
         prefs?.edit()?.clear()?.apply()
     }
 
     // ─── Внутреннее ───────────────────────────────────────────────────────────────────────
+
+    /**
+     * Флаг выхода в prefs SDK. `commit()`, а не `apply()`: `apply()` пишет на диск позже, и
+     * процесс, убитый сразу после выхода, потерял бы сигнал — устройство осталось бы за прежним
+     * пользователем. Запись редкая (выход и его подтверждение), цена синхронной записи мала.
+     */
+    private class PrefsLogoutFlagStore(private val prefs: SharedPreferences) : LogoutFlagStore {
+        override var pending: Boolean
+            get() = prefs.getBoolean(KEY_PENDING_LOGOUT, false)
+            set(value) {
+                if (!prefs.edit().putBoolean(KEY_PENDING_LOGOUT, value).commit()) {
+                    Log.w(TAG, "не удалось сохранить флаг выхода (pending=$value)")
+                }
+            }
+    }
 
     /**
      * Зашифрованные prefs с миграцией из старых открытых.

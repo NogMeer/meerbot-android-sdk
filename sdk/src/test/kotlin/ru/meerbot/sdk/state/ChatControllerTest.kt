@@ -7,6 +7,7 @@ import kotlinx.coroutines.cancel
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.SocketPolicy
+import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -17,6 +18,7 @@ import org.junit.Before
 import org.junit.Test
 import ru.meerbot.sdk.network.ApiClient
 import ru.meerbot.sdk.network.MeerBotConfiguration
+import java.util.concurrent.TimeUnit
 
 /**
  * Поведение на границе сети: что видит пользователь при обрыве, повторе, приходе истории.
@@ -45,18 +47,18 @@ class ChatControllerTest {
         server.shutdown()
     }
 
-    private fun controller(): ChatController = ChatController(
-        client = ApiClient(
-            config = MeerBotConfiguration(
-                apiKey = "pk_live_mobile",
-                baseUrl = server.url("/").toString().trimEnd('/'),
-                sdkVersion = "0.2.0-test",
-            ),
-            visitorUuid = "11111111-1111-1111-1111-111111111111",
-            installationId = "and-22222222-2222-2222-2222-222222222222",
+    private fun apiClient(): ApiClient = ApiClient(
+        config = MeerBotConfiguration(
+            apiKey = "pk_live_mobile",
+            baseUrl = server.url("/").toString().trimEnd('/'),
+            sdkVersion = "0.2.0-test",
         ),
-        scope = scope,
+        visitorUuid = "11111111-1111-1111-1111-111111111111",
+        installationId = "and-22222222-2222-2222-2222-222222222222",
     )
+
+    private fun controller(client: ApiClient = apiClient()): ChatController =
+        ChatController(client = client, scope = scope)
 
     /** Рукопожатие канала: ни приветствия, ни режима оно не отдаёт — только сессию. */
     private fun register() = MockResponse().setBody(
@@ -73,10 +75,14 @@ class ChatControllerTest {
         .setBody(body)
 
     /** Стартовать и дождаться готовности: рукопожатие + пустая история. */
-    private fun started(mode: String = "ai", messages: String = ""): ChatController {
+    private fun started(
+        mode: String = "ai",
+        messages: String = "",
+        client: ApiClient = apiClient(),
+    ): ChatController {
         server.enqueue(register())
         server.enqueue(history(mode = mode, messages = messages))
-        val controller = controller()
+        val controller = controller(client)
         controller.start()
         await(controller) { it.ready }
         return controller
@@ -297,6 +303,92 @@ class ChatControllerTest {
 
         await(controller) { it.messages.any { m -> m.content == "вам ответил менеджер" } }
         assertEquals(ChatMode.Human, controller.state.value.mode)
+    }
+
+    // ─── Смена пользователя ───────────────────────────────────────────────────────────────
+
+    private val previousUserMessage =
+        """{"id":7,"role":"user","content":"мой номер заказа 123","createdAt":"2026-08-14T10:00:00.000Z"}"""
+
+    /**
+     * Следующий человек на телефоне не должен видеть переписку прежнего — ни до ответа сервера,
+     * ни после: пустая история нового треда оставляет ленту пустой, а не возвращает старую.
+     */
+    @Test
+    fun `выход очищает ленту и проходит рукопожатие заново`() {
+        val api = apiClient()
+        val controller = started(messages = previousUserMessage, client = api)
+        assertEquals(1, controller.state.value.messages.size)
+
+        api.logout()
+        controller.resetForIdentityChange()
+
+        assertTrue(controller.state.value.messages.isEmpty())
+        assertTrue(!controller.state.value.ready)
+
+        server.enqueue(register())
+        server.enqueue(history())
+        await(controller) { it.ready }
+
+        assertTrue(controller.state.value.messages.isEmpty())
+        assertEquals("/api/v1/mobile/register", server.takeRequest().path)
+        assertTrue(server.takeRequest().path!!.startsWith("/api/v1/mobile/messages"))
+        val reRegister = server.takeRequest()
+        assertEquals("/api/v1/mobile/register", reRegister.path)
+        assertTrue(JSONObject(reRegister.body.readUtf8()).getBoolean("logout"))
+    }
+
+    @Test
+    fun `приветствие хоста переживает смену пользователя`() {
+        val controller = started(messages = previousUserMessage)
+        controller.store.setGreeting("Чем помочь?")
+        controller.setDraft("черновик прежнего")
+        controller.stop()
+
+        controller.resetForIdentityChange()
+
+        val state = controller.state.value
+        assertEquals("Чем помочь?", state.greeting)
+        assertEquals("", state.draft)
+        assertEquals(0L, state.lastServerMessageId)
+    }
+
+    @Test
+    fun `смена пользователя при закрытом экране не ходит в сеть`() {
+        val api = apiClient()
+        val controller = started(messages = previousUserMessage, client = api)
+        controller.stop()
+        val afterStop = server.requestCount
+
+        api.logout()
+        controller.resetForIdentityChange()
+        Thread.sleep(200)
+
+        assertEquals(afterStop, server.requestCount)
+        assertTrue(controller.state.value.messages.isEmpty())
+        assertTrue(!controller.state.value.ready)
+    }
+
+    /**
+     * Догон ушёл до выхода, страница прежнего пользователя пришла после. Отмены задачи здесь
+     * мало: `refresh()` запускает догон без хранимого `Job`.
+     */
+    @Test
+    fun `страница, запрошенная до смены пользователя, в ленту не попадает`() {
+        val controller = started()
+        controller.stop()
+        server.enqueue(
+            history(messages = previousUserMessage).setBodyDelay(300, TimeUnit.MILLISECONDS)
+        )
+
+        controller.refresh()
+        server.takeRequest() // register
+        server.takeRequest() // стартовая история
+        assertNotNull(server.takeRequest(5, TimeUnit.SECONDS))
+        controller.resetForIdentityChange()
+        Thread.sleep(600)
+
+        assertTrue(controller.state.value.messages.isEmpty())
     }
 
     @Test

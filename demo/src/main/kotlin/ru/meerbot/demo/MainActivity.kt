@@ -126,13 +126,26 @@ private fun DemoApp() {
                     apiKey = apiKey.trim(),
                     baseUrl = baseUrl.trim(),
                 )
-                MeerBot.identify(identityToken.trim().takeIf { it.isNotEmpty() })
+                // Пустое поле — «токена нет», а НЕ выход: identify(null) отвязал бы устройство
+                // от пользователя на сервере. Выход — только кнопкой «Выйти» ниже.
+                identityToken.trim().takeIf { it.isNotEmpty() }?.let { MeerBot.identify(it) }
                 chatOpen = true
             },
             enabled = apiKey.isNotBlank(),
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text("Открыть чат")
+        }
+
+        Button(
+            onClick = {
+                MeerBot.identify(null)
+                prefs.edit().remove("identityToken").apply()
+                identityToken = ""
+            },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("Выйти")
         }
 
         Button(

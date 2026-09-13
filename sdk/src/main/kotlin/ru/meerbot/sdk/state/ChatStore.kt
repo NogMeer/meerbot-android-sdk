@@ -223,4 +223,10 @@ class ChatStore {
     fun resetForLogout() {
         _state.value = ChatState()
     }
+
+    /**
+     * Сменился пользователь: лента, режим, черновик и курсор принадлежат прежнему и уходят.
+     * Приветствие — настройка хоста, а не переписка, поэтому остаётся.
+     */
+    fun resetForIdentityChange() = _state.update { ChatState(greeting = it.greeting) }
 }

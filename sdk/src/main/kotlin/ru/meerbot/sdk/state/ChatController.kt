@@ -12,6 +12,7 @@ import ru.meerbot.sdk.network.ApiClient
 import ru.meerbot.sdk.network.ChatStreamEvent
 import ru.meerbot.sdk.network.HistoryMessage
 import ru.meerbot.sdk.network.MeerBotError
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Связка «сеть ↔ состояние экрана».
@@ -38,6 +39,14 @@ class ChatController(
     /** Экран чата на виду. Догон крутится ТОЛЬКО когда экран открыт и сессия готова. */
     private var screenVisible = false
 
+    /**
+     * Эпоха identity: растёт на каждой смене пользователя. Запрос ленты, отправленный в
+     * прежней эпохе, своего ответа в ленту не кладёт — иначе догон, стартовавший до выхода,
+     * вернул бы в очищенную ленту переписку прежнего пользователя. Отмены задач для этого
+     * мало: часть догонов запускается без хранимого `Job`.
+     */
+    private val identityEpoch = AtomicInteger()
+
     internal companion object {
         /** Периоды догона — те же, что у веб-виджета. `var` ради тестов (там 50 мс). */
         var managerPollIntervalMs = 6_000L
@@ -60,22 +69,41 @@ class ChatController(
             startPolling()
             return
         }
+        val startedEpoch = identityEpoch.get()
         startJob = scope.launch {
             try {
                 client.openSession()
+                // Пока шло рукопожатие, сменился пользователь: состоянием владеет уже новый старт.
+                if (identityEpoch.get() != startedEpoch) return@launch
                 store.setError(null)
                 // История подтягивается всегда: диалог у канала один на устройство, и после
                 // переустановки экрана лента обязана прийти с сервера, а не остаться пустой.
                 runCatching { loadHistory() }
+                if (identityEpoch.get() != startedEpoch) return@launch
                 store.setReady(true)
                 startPolling()
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Throwable) {
+                if (identityEpoch.get() != startedEpoch) return@launch
                 store.setReady(false)
                 store.setError(chatError(e))
             }
         }
+    }
+
+    /**
+     * Сменился пользователь (`MeerBot.identify`): лента прежнего уходит сразу, не дожидаясь
+     * сети. Задачи прежней сессии отменяются, `ready` сбрасывается — следующее открытие
+     * обязано пройти рукопожатие заново. Если экран сейчас на виду, он перезапускается сам;
+     * закрытый экран сети не трогает.
+     */
+    fun resetForIdentityChange() {
+        val wasVisible = screenVisible
+        identityEpoch.incrementAndGet()
+        stop()
+        store.resetForIdentityChange()
+        if (wasVisible) start()
     }
 
     fun setDraft(text: String) = store.setDraft(text)
@@ -191,6 +219,7 @@ class ChatController(
     private suspend fun catchUp(silent: Boolean) {
         val state = store.state.value
         if (!state.ready || state.sending) return
+        val startedEpoch = identityEpoch.get()
 
         try {
             // Цикл `for` с `break`, а НЕ `repeat { … return@repeat }`: последнее возвращает
@@ -204,6 +233,7 @@ class ChatController(
                 if (!currentCoroutineContext().isActive) return
                 val cursor = store.lastServerMessageId
                 val response = client.history(since = if (cursor > 0) cursor else null, limit = 50)
+                if (identityEpoch.get() != startedEpoch) return
                 store.setMode(response.mode)
                 store.mergeServerMessages(mapHistory(response.messages))
                 if (!response.hasMore) break
@@ -214,7 +244,7 @@ class ChatController(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
-            if (!silent) store.setError(chatError(e))
+            if (!silent && identityEpoch.get() == startedEpoch) store.setError(chatError(e))
         }
     }
 
@@ -311,6 +341,7 @@ class ChatController(
         store.dropEmptyPlaceholder(placeholderId)
 
         if (error is MeerBotError.Cancelled) return
+        val startedEpoch = identityEpoch.get()
 
         store.setError(chatError(error))
 
@@ -318,6 +349,8 @@ class ChatController(
         // принимаем ТОЛЬКО если она заканчивается ответом: иначе замена выбросила бы из UI
         // недоставленное сообщение пользователя.
         val items = runCatching { fetchHistory() }.getOrNull()
+        // Пользователь сменился, пока шёл запрос: его новой ленте чужой «Повторить» не нужен.
+        if (identityEpoch.get() != startedEpoch) return
         if (items != null && items.lastOrNull()?.role == "assistant") {
             store.replaceAll(items)
             return
@@ -329,16 +362,19 @@ class ChatController(
 
     /** Догон истории: сервер — источник правды, локальную ленту заменяем целиком. */
     private suspend fun loadHistory() {
-        val items = fetchHistory()
+        val items = fetchHistory() ?: return
         if (items.isEmpty()) return
         store.replaceAll(items)
     }
 
     /**
      * Хвост треда с сервера (без курсора) — для полной замены ленты при старте и после обрыва.
+     * `null` — пока шёл запрос, сменился пользователь, и страница принадлежит прежнему.
      */
-    private suspend fun fetchHistory(): List<ChatMessage> {
+    private suspend fun fetchHistory(): List<ChatMessage>? {
+        val startedEpoch = identityEpoch.get()
         val page = client.history()
+        if (identityEpoch.get() != startedEpoch) return null
         store.setMode(page.mode)
         return mapHistory(page.messages)
     }

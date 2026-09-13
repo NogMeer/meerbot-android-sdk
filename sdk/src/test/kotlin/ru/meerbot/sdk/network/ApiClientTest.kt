@@ -12,6 +12,7 @@ import okhttp3.mockwebserver.SocketPolicy
 import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
@@ -19,6 +20,7 @@ import org.junit.Before
 import org.junit.Test
 import ru.meerbot.sdk.R
 import ru.meerbot.sdk.state.ChatMode
+import java.util.concurrent.TimeUnit
 
 /**
  * Сетевой слой канала `mobile_app` против MockWebServer.
@@ -41,7 +43,7 @@ class ApiClientTest {
         server.shutdown()
     }
 
-    private fun client() = ApiClient(
+    private fun client(logoutFlag: LogoutFlagStore = InMemoryLogoutFlagStore()) = ApiClient(
         config = MeerBotConfiguration(
             apiKey = "pk_live_mobile",
             baseUrl = server.url("/").toString().trimEnd('/'),
@@ -49,22 +51,31 @@ class ApiClientTest {
         ),
         visitorUuid = VISITOR,
         installationId = INSTALLATION,
+        logoutFlag = logoutFlag,
     )
 
+    /** `unlinked = null` — ответ старого сервера, который поля не знает. */
     private fun registerResponse(
         jwt: String = "jwt-1",
         expiresIn: Int = 900,
         identityStatus: String = "not_provided",
         attestationRequired: Boolean = false,
+        unlinked: Boolean? = null,
     ) = MockResponse().setBody(
         JSONObject()
             .put("deviceId", "42")
             .put("jwt", jwt)
             .put("expiresIn", expiresIn)
             .put("attestationRequired", attestationRequired)
-            .put("identity", JSONObject().put("status", identityStatus))
+            .put(
+                "identity",
+                JSONObject().put("status", identityStatus)
+                    .apply { if (unlinked != null) put("unlinked", unlinked) },
+            )
             .toString()
     )
+
+    private fun registerBody() = JSONObject(server.takeRequest().body.readUtf8())
 
     private fun sse(body: String) = MockResponse()
         .setHeader("Content-Type", "text/event-stream")
@@ -137,6 +148,181 @@ class ApiClientTest {
         // Ждать 15 минут до применения identity нельзя — токен обязан обновиться сразу.
         assertEquals("jwt-identified", api.validToken())
         assertEquals(2, server.requestCount)
+    }
+
+    // ─── Выход ────────────────────────────────────────────────────────────────────────────
+
+    @Test
+    fun `без выхода поле logout в рукопожатие не уходит`() = runBlocking {
+        // Сервер держит связь устройства, пока не придёт явный выход: лишний `logout` отвязал
+        // бы вошедшего пользователя на каждом старте.
+        server.enqueue(registerResponse())
+
+        client().openSession()
+
+        assertFalse(registerBody().has("logout"))
+    }
+
+    @Test
+    fun `выход уходит в рукопожатие без токена идентичности`() = runBlocking {
+        server.enqueue(registerResponse(identityStatus = "verified"))
+        server.enqueue(registerResponse(unlinked = true))
+        val api = client()
+        api.setIdentityToken("signed")
+        api.openSession()
+
+        api.logout()
+        api.openSession()
+
+        assertEquals("signed", registerBody().getString("identityToken"))
+        val body = registerBody()
+        assertTrue(body.getBoolean("logout"))
+        assertFalse(body.has("identityToken"))
+    }
+
+    @Test
+    fun `подтверждённый сервером выход больше не повторяется`() = runBlocking {
+        val flag = InMemoryLogoutFlagStore()
+        server.enqueue(registerResponse(unlinked = true))
+        server.enqueue(registerResponse(jwt = "jwt-2"))
+        val api = client(flag)
+
+        api.logout()
+        api.openSession()
+        assertFalse(flag.pending)
+        api.invalidateToken()
+        api.openSession()
+
+        assertTrue(registerBody().getBoolean("logout"))
+        assertFalse(registerBody().has("logout"))
+    }
+
+    @Test
+    fun `unlinked false тоже подтверждает выход`() = runBlocking {
+        // Устройство без связи: отвязывать нечего, но сервер выход понял — слать снова незачем.
+        val flag = InMemoryLogoutFlagStore()
+        server.enqueue(registerResponse(unlinked = false))
+        val api = client(flag)
+
+        api.logout()
+        api.openSession()
+
+        assertFalse(flag.pending)
+    }
+
+    @Test
+    fun `старый сервер без unlinked получает выход снова`() = runBlocking {
+        val flag = InMemoryLogoutFlagStore()
+        server.enqueue(registerResponse())
+        server.enqueue(registerResponse(jwt = "jwt-2"))
+        val api = client(flag)
+
+        api.logout()
+        api.openSession()
+        assertTrue(flag.pending)
+        api.invalidateToken()
+        api.openSession()
+
+        assertTrue(registerBody().getBoolean("logout"))
+        assertTrue(registerBody().getBoolean("logout"))
+    }
+
+    @Test
+    fun `выход из прошлого запуска уходит в первое рукопожатие`() = runBlocking {
+        // Флаг лежит в хранилище, а клиент создан заново — как после перезапуска процесса.
+        server.enqueue(registerResponse(unlinked = true))
+        val flag = InMemoryLogoutFlagStore(pending = true)
+
+        client(flag).openSession()
+
+        assertTrue(registerBody().getBoolean("logout"))
+        assertFalse(flag.pending)
+    }
+
+    @Test
+    fun `выход сбрасывает сессию сразу`() = runBlocking {
+        server.enqueue(registerResponse(jwt = "jwt-linked", identityStatus = "verified"))
+        server.enqueue(registerResponse(jwt = "jwt-anon", unlinked = true))
+        val api = client()
+        api.setIdentityToken("signed")
+        assertEquals("jwt-linked", api.validToken())
+        api.rememberConversationId(77)
+
+        api.logout()
+
+        assertNull(api.conversationId)
+        assertEquals(IdentityStatus.NotProvided, api.identityStatus)
+        assertEquals("jwt-anon", api.validToken())
+        assertEquals(2, server.requestCount)
+    }
+
+    @Test
+    fun `выход и новый токен уходят одним рукопожатием`() = runBlocking {
+        // Сервер решает сам: другой пользователь — новая строка, тот же — связь остаётся.
+        server.enqueue(registerResponse(identityStatus = "verified", unlinked = true))
+        val api = client()
+
+        api.logout()
+        api.setIdentityToken("B")
+        api.openSession()
+
+        val body = registerBody()
+        assertTrue(body.getBoolean("logout"))
+        assertEquals("B", body.getString("identityToken"))
+    }
+
+    /**
+     * Рукопожатие ушло до выхода, ответ пришёл после. Его JWT выписан на устройство прежнего
+     * пользователя: сохранить его — значит открыть следующему человеку чужую ленту.
+     */
+    @Test
+    fun `рукопожатие, начатое до выхода, своей сессии не сохраняет`() = runBlocking {
+        val flag = InMemoryLogoutFlagStore()
+        server.enqueue(
+            registerResponse(jwt = "jwt-linked", identityStatus = "verified")
+                .setBodyDelay(400, TimeUnit.MILLISECONDS)
+        )
+        server.enqueue(registerResponse(jwt = "jwt-anon", unlinked = true))
+        val api = client(flag)
+        api.setIdentityToken("signed")
+
+        val token = withContext(Dispatchers.Default) {
+            val pending = async { api.validToken() }
+            val first = JSONObject(server.takeRequest(5, TimeUnit.SECONDS)!!.body.readUtf8())
+            assertEquals("signed", first.getString("identityToken"))
+            api.logout()
+            pending.await()
+        }
+
+        assertEquals("jwt-anon", token)
+        assertEquals(2, server.requestCount)
+        assertTrue(registerBody().getBoolean("logout"))
+        assertFalse(flag.pending)
+        assertEquals("jwt-anon", api.validToken())
+    }
+
+    @Test
+    fun `снятое с регистрации устройство переподключается и запрос повторяется один раз`() = runBlocking {
+        // После выхода токен прежней сессии указывает на устройство в отставке.
+        server.enqueue(registerResponse(jwt = "jwt-old"))
+        server.enqueue(errorResponse(401, "device_not_found"))
+        server.enqueue(registerResponse(jwt = "jwt-new"))
+        server.enqueue(MockResponse().setBody("""{"messages":[],"hasMore":false,"mode":"ai"}"""))
+
+        client().history()
+
+        assertEquals(4, server.requestCount)
+        server.takeRequest()
+        assertEquals("Bearer jwt-old", server.takeRequest().getHeader("Authorization"))
+        server.takeRequest()
+        assertEquals("Bearer jwt-new", server.takeRequest().getHeader("Authorization"))
+    }
+
+    @Test
+    fun `токен без устройства тоже лечится новым рукопожатием`() {
+        assertTrue(ApiClient.decodeError(401, """{"error":{"code":"device_claim_missing"}}""").isExpiredToken)
+        assertTrue(ApiClient.decodeError(401, """{"error":{"code":"device_not_found"}}""").isExpiredToken)
+        assertFalse(ApiClient.decodeError(403, """{"error":{"code":"channel_mismatch"}}""").isExpiredToken)
     }
 
     @Test
