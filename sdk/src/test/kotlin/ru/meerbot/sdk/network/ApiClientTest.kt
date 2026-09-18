@@ -123,6 +123,18 @@ class ApiClientTest {
     }
 
     @Test
+    fun `без appContext поле device в рукопожатие не попадает`() = runBlocking {
+        // `client()` (как и большинство тестов файла) собирает ApiClient без appContext —
+        // ровно так, как SDK работал до 0.3.0. Пустого/null `device` в теле быть не должно.
+        server.enqueue(registerResponse())
+
+        client().openSession()
+
+        val body = JSONObject(server.takeRequest().body.readUtf8())
+        assertFalse(body.has("device"))
+    }
+
+    @Test
     fun `токен идентичности уходит в рукопожатие и статус возвращается`() = runBlocking {
         server.enqueue(registerResponse(identityStatus = "verified"))
         val api = client()

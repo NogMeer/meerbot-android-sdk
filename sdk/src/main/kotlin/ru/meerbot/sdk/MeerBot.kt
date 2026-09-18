@@ -168,7 +168,7 @@ object MeerBot {
         EarlyLogout.attach(appContext)
         // Выход до настройки — из прошлого запуска или другого процесса. Читается здесь, с диска.
         val earlyMarkers = EarlyLogout.file.read()
-        mainThread.execute { applyConfiguration(store, configuration, httpClient, earlyMarkers) }
+        mainThread.execute { applyConfiguration(store, configuration, httpClient, earlyMarkers, appContext) }
     }
 
     @MainThread
@@ -177,6 +177,7 @@ object MeerBot {
         configuration: MeerBotConfiguration,
         httpClient: OkHttpClient,
         earlyMarkers: List<String>,
+        appContext: Context,
     ) {
         // Повторный configure: прежний клиент делит с новым флаг выхода в тех же prefs, но не
         // счётчики. Ответ, пришедший ему позже, стёр бы флаг на диске, пока новый держит его
@@ -198,6 +199,7 @@ object MeerBot {
             PrefsLogoutFlagStore(store),
             // Счётчик смен identity — в тех же prefs: `reset()` чистит его вместе с установкой.
             PrefsIdentitySeqStore(store),
+            appContext,
         )
         val chat = ChatController(apiClient, scope)
         val coordinator = IdentityCoordinator(

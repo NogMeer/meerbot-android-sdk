@@ -1,5 +1,6 @@
 package ru.meerbot.sdk.network
 
+import android.content.Context
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.awaitCancellation
@@ -100,21 +101,36 @@ class ApiClient internal constructor(
     private val logoutFlag: LogoutFlagStore,
     /** Счётчик смен identity (`identitySeq`). Растёт вместе с флагом выхода, см. [IdentitySeqStore]. */
     private val identitySeq: IdentitySeqStore = InMemoryIdentitySeqStore(),
+    /**
+     * Контекст приложения — только для сбора device-контекста рукопожатия ([DeviceContext]).
+     * `null` (тесты, хосты без него) — поле `device` в тело `register` просто не добавляется.
+     */
+    private val appContext: Context? = null,
 ) {
 
     /**
      * Публичный конструктор ровно в форме 0.2.8 — `(config, visitorUuid, installationId,
-     * httpClient = default)`. Пятый параметр в публичной сигнатуре убрал бы из байткода и
-     * 4-аргументный конструктор, и синтетический с маской умолчаний: приложение, собранное
-     * против 0.2.8, падало бы `NoSuchMethodError` на патч-обновлении. Хранилище флага выхода —
-     * деталь `MeerBot`, снаружи его задавать незачем; здесь флаг живёт в памяти.
+     * httpClient = default)`, плюс новый необязательный `appContext` (с 0.3.0). `@JvmOverloads`
+     * генерирует и старые Java-сигнатуры (3 и 4 аргумента), и новую полную — убрать её значило
+     * бы `NoSuchMethodError` на патч-обновлении у приложения, собранного против 0.2.8. Хранилище
+     * флага выхода — деталь `MeerBot`, снаружи его задавать незачем; здесь флаг живёт в памяти.
      */
+    @JvmOverloads
     constructor(
         config: MeerBotConfiguration,
         visitorUuid: String,
         installationId: String,
         httpClient: OkHttpClient = defaultHttpClient(),
-    ) : this(config, visitorUuid, installationId, httpClient, InMemoryLogoutFlagStore(), InMemoryIdentitySeqStore())
+        appContext: Context? = null,
+    ) : this(
+        config,
+        visitorUuid,
+        installationId,
+        httpClient,
+        InMemoryLogoutFlagStore(),
+        InMemoryIdentitySeqStore(),
+        appContext,
+    )
 
     private val tokenMutex = Mutex()
 
@@ -388,6 +404,14 @@ class ApiClient internal constructor(
             // Всегда, в том числе 0: сервер упорядочивает выходы и входы по счётчику, а не по
             // часам бэкенда интегратора. Старый сервер поле игнорирует.
             body.put("identitySeq", seqSent)
+            // Только непустые поля, и только если контекст вообще есть (тесты, хосты без него) —
+            // пустой `device` в теле хуже отсутствующего.
+            appContext?.let { ctx ->
+                val device = DeviceContext.collect(ctx, config)
+                if (device.isNotEmpty()) {
+                    body.put("device", JSONObject(device))
+                }
+            }
 
             val request = newRequest("/api/v1/mobile/register")
                 .post(body.toString().toRequestBody(JSON))

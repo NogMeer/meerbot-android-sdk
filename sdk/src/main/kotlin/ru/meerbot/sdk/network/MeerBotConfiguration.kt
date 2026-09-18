@@ -30,6 +30,14 @@ data class MeerBotConfiguration(
     val apiKey: String,
     val baseUrl: String = DEFAULT_BASE_URL,
     val sdkVersion: String = BuildConfig.SDK_VERSION,
+    /**
+     * Версия хост-приложения для device-контекста `register`. `null` (по умолчанию) — SDK
+     * берёт `versionName` из `PackageInfo` самостоятельно; задавать вручную нужно только если
+     * хост хочет прислать своё значение (например, отличное от манифеста).
+     */
+    val appVersion: String? = null,
+    /** Сборка хост-приложения для device-контекста. `null` — SDK берёт `versionCode`/`longVersionCode` сам. */
+    val appBuild: String? = null,
 ) {
     companion object {
         const val DEFAULT_BASE_URL = "https://meerbot.ru"
