@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Пути, которые FileProvider SDK вправе отдавать по content://-Uri. Только подкаталог
+  meerbot_media в приватном cacheDir приложения: туда SDK кладёт скачанное вложение перед
+  открытием, и наружу ничего лишнего не уходит.
+-->
+<paths>
+    <cache-path name="meerbot_media" path="meerbot_media/" />
+</paths>

@@ -14,6 +14,7 @@ import ru.meerbot.sdk.network.ChatStreamEvent
 import ru.meerbot.sdk.network.HistoryMessage
 import ru.meerbot.sdk.network.HistoryPage
 import ru.meerbot.sdk.network.MeerBotError
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -77,6 +78,8 @@ class ChatController(
         var idlePollIntervalMs = 12_000L
         /** Потолок страниц за один догон: цикл не имеет права стать бесконечным. */
         const val MAX_CATCH_UP_PAGES = 5
+        /** Потолок вложений на сообщение — контракт бэкенда (`uploadIds[] ≤ 10`). */
+        const val MAX_ATTACHMENTS = 10
 
         /**
          * RFC 4122 (версии 1–5) — ровно то, что принимает сервер. Строка ленты, заведённая
@@ -137,19 +140,52 @@ class ChatController(
         identityEpoch.incrementAndGet()
         catchUpSuspended = false
         stop()
+        pendingOutgoing.clear()
         store.resetForIdentityChange()
         if (wasVisible) start()
     }
 
     fun setDraft(text: String) = store.setDraft(text)
 
+    /**
+     * Байты выбранных вложений, ждущие загрузки, по id строки ленты. Держатся до тех пор, пока
+     * на сообщение не пришёл ответ (тогда повтор не нужен): повтор берёт их отсюда и грузит
+     * заново — тот же `clientMessageId` не даст дубля на сервере. Только главный поток.
+     */
+    private val pendingOutgoing = mutableMapOf<String, List<OutgoingAttachment>>()
+
     @MainThread
-    fun send(text: String) {
+    fun send(text: String) = send(text, emptyList())
+
+    /**
+     * Отправить сообщение с вложениями. Порядок: оптимистичная строка с ЛОКАЛЬНЫМИ вложениями
+     * (рисуются из [LocalMediaCache], свой файл незачем качать обратно) появляется сразу; загрузка
+     * (`POST /mobile/upload`) идёт уже в [run] перед стримом. Сбой загрузки не теряет ни текст, ни
+     * вложения: строка помечается недоставленной, «Повторить» грузит их заново.
+     *
+     * Пустой текст при непустых вложениях разрешён. Больше [MAX_ATTACHMENTS] не отправляем —
+     * лишнее обрезаем (экран не должен был позволить их выбрать).
+     */
+    @MainThread
+    fun send(text: String, attachments: List<OutgoingAttachment>) {
         val trimmed = text.trim()
-        if (trimmed.isEmpty() || store.sending || store.mode == ChatMode.Closed) return
+        val capped = attachments.take(MAX_ATTACHMENTS)
+        if ((trimmed.isEmpty() && capped.isEmpty()) || store.sending || store.mode == ChatMode.Closed) return
         store.setRetryable(null)
         store.clearDraft()
-        val userMessage = store.appendUserMessage(trimmed)
+        val localAttachments = capped.map { outgoing ->
+            val mediaId = Attachment.LOCAL_PREFIX + UUID.randomUUID()
+            LocalMediaCache.put(mediaId, outgoing.bytes)
+            Attachment(
+                mediaId = mediaId,
+                kind = outgoing.kind,
+                mime = outgoing.mime,
+                fileName = outgoing.fileName,
+                size = outgoing.size,
+            )
+        }
+        val userMessage = store.appendUserMessage(trimmed, localAttachments)
+        if (capped.isNotEmpty()) pendingOutgoing[userMessage.id] = capped
         run(trimmed, userMessage.id)
     }
 
@@ -211,6 +247,20 @@ class ChatController(
      * диалоге, который открыт на экране.
      */
     val conversationId: Long? get() = client.conversationId
+
+    /**
+     * Байты вложения для отрисовки/скачивания. Своё, ещё не подтверждённое сервером вложение
+     * (`mediaId` с префиксом [Attachment.LOCAL_PREFIX]) берётся из [LocalMediaCache] — качать его
+     * обратно незачем; иначе — авторизованный `GET /mobile/media/<messageId>/<mediaId>`.
+     *
+     * @throws MeerBotError сеть/401/пропавшее медиа — вызывающий (экран) рисует заглушку.
+     */
+    suspend fun mediaBytes(messageServerId: Long?, attachment: Attachment): ByteArray {
+        LocalMediaCache.get(attachment.mediaId)?.let { return it }
+        val messageId = messageServerId
+            ?: throw MeerBotError.InvalidResponse
+        return client.fetchMedia(messageId, attachment.mediaId)
+    }
 
     @MainThread
     fun stop() {
@@ -336,12 +386,19 @@ class ChatController(
         // и сервер не сохранит сообщение дважды и не оплатит второй ответ.
         val clientMessageId = userMessageId.lowercase().takeIf { UUID_RE.matches(it) }
 
+        val outgoing = pendingOutgoing[userMessageId].orEmpty()
+
         streamJob = scope.launch {
             // Итог потока: закончил ли сервер сам (`[DONE]`, ошибка, таймаут, рестарт) — отличает
             // завершённую отправку от оборванной отменой — и дал ли он ответ.
             val outcome = StreamOutcome()
             try {
-                client.sendMessage(text, clientMessageId).collect {
+                // Вложения грузятся ПЕРЕД стримом: сбой (сеть, 415, 429) прилетит сюда же
+                // исключением и уйдёт в [handleFailure] — строка станет недоставленной с
+                // «Повторить», а текст и вложения не потеряются. Повтор грузит заново; тот же
+                // `clientMessageId` не даст серверу дубля.
+                val uploadIds = outgoing.map { client.uploadAttachment(it.bytes, it.fileName, it.mime).uploadId }
+                client.sendMessage(text, clientMessageId, uploadIds).collect {
                     handle(it, userMessageId, placeholderId, outcome)
                 }
                 outcome.serverFinished = true
@@ -356,6 +413,8 @@ class ChatController(
                 // плановый рестарт): сообщение на сервере есть, ответа нет — «Повторить»
                 // безопасен, повтор с тем же id ответ догенерирует.
                 if (!outcome.answered) offerRetryIfUnanswered(userMessageId, text, outcome.error)
+                // Ответ есть — повтор больше не нужен, байты вложений можно отпустить.
+                if (outcome.answered || store.isSettled(userMessageId)) pendingOutgoing.remove(userMessageId)
             } catch (e: CancellationException) {
                 // Отмена приходит от stop() (экран закрыт, приложение ушло в фон), от новой
                 // отправки или от смены пользователя. Общий флаг отправки не трогаем — им уже
@@ -418,7 +477,11 @@ class ChatController(
             }
 
             is ChatStreamEvent.Manager -> {
-                store.appendOperatorMessage(event.message.text, event.message.authorName)
+                store.appendOperatorMessage(
+                    event.message.text,
+                    event.message.authorName,
+                    event.message.attachments,
+                )
                 store.setOperatorTyping(null)
                 outcome.answered = true
             }
@@ -675,6 +738,7 @@ class ChatController(
                 authorName = item.authorName,
                 content = item.content,
                 timestamp = item.createdAtMs,
+                attachments = item.attachments,
             )
         }
 

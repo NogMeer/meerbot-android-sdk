@@ -38,4 +38,17 @@
 
     <string name="meerbot_not_configured_title">MeerBot не настроен</string>
     <string name="meerbot_not_configured_body">Вызовите MeerBot.configure(context, apiKey) при старте приложения.</string>
+
+    <!-- Вложения -->
+    <string name="meerbot_attach">Прикрепить файл</string>
+    <string name="meerbot_attach_media">Фото и видео</string>
+    <string name="meerbot_attach_file">Файл</string>
+    <string name="meerbot_attach_remove">Убрать вложение</string>
+    <string name="meerbot_attach_limit">Можно прикрепить не больше %1$d файлов</string>
+    <string name="meerbot_attach_read_failed">Не удалось прочитать файл. Попробуйте ещё раз.</string>
+    <string name="meerbot_attachment_generic">Вложение</string>
+    <string name="meerbot_attachment_image">Изображение</string>
+    <string name="meerbot_attachment_file">Файл: %1$s</string>
+    <string name="meerbot_attachment_download_failed">Не удалось скачать файл. Попробуйте ещё раз.</string>
+    <string name="meerbot_attachment_no_viewer">Нет приложения для открытия этого файла.</string>
 </resources>

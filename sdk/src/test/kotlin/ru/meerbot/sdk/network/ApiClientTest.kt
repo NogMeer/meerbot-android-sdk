@@ -987,6 +987,113 @@ class ApiClientTest {
         assertEquals(ChatMode.Ai, page.mode)
     }
 
+    @Test
+    fun `история несёт вложения строки`() = runBlocking {
+        server.enqueue(registerResponse())
+        server.enqueue(
+            MockResponse().setBody(
+                """{"messages":[
+                   {"id":1,"role":"user","content":"вот файл","createdAt":"2026-08-14T10:00:00.000Z",
+                    "attachments":[{"mediaId":"m1","kind":"document","mime":"application/pdf","fileName":"doc.pdf","size":10}]}
+                ],"hasMore":false,"mode":"ai"}"""
+            )
+        )
+
+        val page = client().history()
+
+        assertEquals(1, page.messages[0].attachments.size)
+        val att = page.messages[0].attachments.single()
+        assertEquals("m1", att.mediaId)
+        assertEquals("doc.pdf", att.fileName)
+        assertEquals("document", att.kind)
+        assertEquals(10L, att.size)
+    }
+
+    // ─── Вложения ─────────────────────────────────────────────────────────────────────────
+
+    @Test
+    fun `загрузка вложения идёт multipart в свой роут с Bearer`() = runBlocking {
+        server.enqueue(registerResponse())
+        server.enqueue(
+            MockResponse().setBody(
+                """{"uploadId":"up_1","status":"ready","kind":"image","mime":"image/png","fileName":"a.png","size":3}"""
+            )
+        )
+        val api = client()
+
+        val result = api.uploadAttachment(byteArrayOf(1, 2, 3), "a.png", "image/png")
+
+        assertEquals("up_1", result.uploadId)
+        assertEquals("image", result.kind)
+        assertEquals(3L, result.size)
+        server.takeRequest() // рукопожатие
+        val req = server.takeRequest()
+        assertEquals("/api/v1/mobile/upload", req.path)
+        assertEquals("POST", req.method)
+        assertEquals("Bearer jwt-1", req.getHeader("Authorization"))
+        assertTrue(req.getHeader("Content-Type")!!.startsWith("multipart/form-data"))
+        val body = req.body.readUtf8()
+        assertTrue("поле file обязано быть", body.contains("name=\"file\""))
+        assertTrue("имя файла обязано доехать", body.contains("a.png"))
+    }
+
+    @Test
+    fun `отказ загрузки отдаёт машинный код`() = runBlocking {
+        server.enqueue(registerResponse())
+        server.enqueue(errorResponse(415, "mime_not_allowed"))
+
+        val error = runCatching {
+            client().uploadAttachment(byteArrayOf(1), "a.exe", "application/octet-stream")
+        }.exceptionOrNull()
+
+        assertEquals("mime_not_allowed", (error as MeerBotError).code)
+    }
+
+    @Test
+    fun `отправка с вложениями несёт uploadIds`() = runBlocking {
+        server.enqueue(registerResponse())
+        server.enqueue(sse("data: [DONE]\n\n"))
+        val api = client()
+
+        api.sendMessage("", clientMessageId = null, uploadIds = listOf("u1", "u2")).toList()
+
+        server.takeRequest() // рукопожатие
+        val body = JSONObject(server.takeRequest().body.readUtf8())
+        // message может быть пустым при непустых uploadIds.
+        assertEquals("", body.getString("message"))
+        val ids = body.getJSONArray("uploadIds")
+        assertEquals(2, ids.length())
+        assertEquals("u1", ids.getString(0))
+        assertEquals("u2", ids.getString(1))
+    }
+
+    @Test
+    fun `отправка без вложений поле uploadIds не шлёт`() = runBlocking {
+        server.enqueue(registerResponse())
+        server.enqueue(sse("data: [DONE]\n\n"))
+
+        client().sendMessage("привет").toList()
+
+        server.takeRequest()
+        val body = JSONObject(server.takeRequest().body.readUtf8())
+        assertTrue("старый текстовый путь не должен обрасти полем", !body.has("uploadIds"))
+    }
+
+    @Test
+    fun `скачивание медиа идёт по своему роуту с Bearer`() = runBlocking {
+        server.enqueue(registerResponse())
+        server.enqueue(MockResponse().setBody("PNGDATA"))
+        val api = client()
+
+        val bytes = api.fetchMedia(messageId = 77, mediaId = "m1")
+
+        assertEquals("PNGDATA", String(bytes))
+        server.takeRequest() // рукопожатие
+        val req = server.takeRequest()
+        assertEquals("/api/v1/mobile/media/77/m1", req.path)
+        assertEquals("Bearer jwt-1", req.getHeader("Authorization"))
+    }
+
     // ─── Разбор служебного ────────────────────────────────────────────────────────────────
 
     @Test

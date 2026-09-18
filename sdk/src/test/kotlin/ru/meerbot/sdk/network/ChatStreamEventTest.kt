@@ -152,4 +152,50 @@ class ChatStreamEventTest {
         val result = event("meta", "{не json")
         assertEquals(ChatStreamEvent.Meta(-1L, ChatMode.Ai), result)
     }
+
+    @Test
+    fun `ответ менеджера несёт вложения`() {
+        val result = event(
+            "manager_message",
+            "{\"messageId\":9,\"text\":\"Смотрите\",\"authorName\":\"Марат\"," +
+                "\"attachments\":[{\"mediaId\":\"m1\",\"kind\":\"image\",\"mime\":\"image/png\"," +
+                "\"fileName\":\"screen.png\",\"size\":2048,\"width\":800,\"height\":600}]}",
+        ) as ChatStreamEvent.Manager
+
+        assertEquals(1, result.message.attachments.size)
+        val att = result.message.attachments.single()
+        assertEquals("m1", att.mediaId)
+        assertEquals("image", att.kind)
+        assertEquals("screen.png", att.fileName)
+        assertEquals(2048L, att.size)
+        assertEquals(800, att.width)
+        assertEquals(600, att.height)
+    }
+
+    /** Ответ только с вложением (пустой текст) — не служебный кадр, его надо показать. */
+    @Test
+    fun `ответ менеджера только с вложением не пропускается`() {
+        val result = event(
+            "manager_message",
+            "{\"messageId\":9,\"text\":\"\",\"attachments\":[{\"mediaId\":\"m1\",\"mime\":\"image/png\"}]}",
+        )
+        assertTrue(result is ChatStreamEvent.Manager)
+        assertEquals(1, (result as ChatStreamEvent.Manager).message.attachments.size)
+    }
+
+    /** Совсем пустой ответ менеджера (ни текста, ни вложений) — служебный, пропускается. */
+    @Test
+    fun `пустой ответ менеджера без вложений пропускается`() {
+        assertNull(event("manager_message", "{\"messageId\":9,\"text\":\"\"}"))
+    }
+
+    /** Вложения — в теле класса: сравнение `Manager` прежним `equals` не должно измениться. */
+    @Test
+    fun `вложения не участвуют в equals менеджера`() {
+        val withAttachments = event(
+            "manager_message",
+            "{\"messageId\":9,\"text\":\"привет\",\"attachments\":[{\"mediaId\":\"m1\",\"mime\":\"image/png\"}]}",
+        )
+        assertEquals(ChatStreamEvent.Manager(ManagerMessage(9L, "привет", null)), withAttachments)
+    }
 }

@@ -198,6 +198,61 @@ class ChatControllerTest {
     }
 
     @Test
+    fun `отправка с вложением грузит файл и шлёт uploadId`() {
+        val controller = started()
+        server.enqueue(
+            MockResponse().setBody(
+                """{"uploadId":"up_1","status":"ready","kind":"image","mime":"image/png","fileName":"a.png","size":3}"""
+            )
+        )
+        server.enqueue(sse(metaFrame + "data: {\"choices\":[{\"delta\":{\"content\":\"вижу\"}}]}\n\ndata: [DONE]\n\n"))
+
+        controller.send(
+            "смотрите",
+            listOf(OutgoingAttachment(byteArrayOf(1, 2, 3), "a.png", "image/png")),
+        )
+
+        await(controller) { !it.sending && it.messages.any { m -> m.content == "вижу" } }
+        // Оптимистичная строка пользователя несёт ЛОКАЛЬНОЕ вложение (рисуется из кэша).
+        val user = controller.state.value.messages.first { it.role == "user" }
+        assertEquals("смотрите", user.content)
+        assertEquals(1, user.attachments.size)
+        assertTrue(user.attachments.single().isLocal)
+        assertEquals("image", user.attachments.single().kind)
+
+        server.takeRequest() // рукопожатие
+        server.takeRequest() // история старта
+        val upload = server.takeRequest()
+        assertEquals("/api/v1/mobile/upload", upload.path)
+        val stream = server.takeRequest()
+        assertEquals("/api/v1/mobile/chat/stream", stream.path)
+        val body = JSONObject(stream.body.readUtf8())
+        assertEquals("смотрите", body.getString("message"))
+        assertEquals("up_1", body.getJSONArray("uploadIds").getString(0))
+    }
+
+    @Test
+    fun `сбой загрузки вложения не теряет сообщение и разрешает повтор`() {
+        val controller = started()
+        server.enqueue(MockResponse().setResponseCode(415).setBody("""{"error":{"code":"mime_not_allowed","message":"no"}}"""))
+
+        controller.send(
+            "файл",
+            listOf(OutgoingAttachment(byteArrayOf(9), "bad.exe", "application/octet-stream")),
+        )
+
+        await(controller) { it.retryable != null }
+        val state = controller.state.value
+        assertEquals("файл", state.retryable)
+        assertNotNull(state.connectionError)
+        val user = state.messages.first { it.role == "user" }
+        assertTrue("сообщение помечено недоставленным", user.failed)
+        // Вложение осталось на строке — при повторе его не надо выбирать заново.
+        assertEquals(1, user.attachments.size)
+        assertTrue(!state.sending)
+    }
+
+    @Test
     fun `обрыв помечает сообщение недоставленным и разрешает повтор`() {
         val controller = started()
         server.enqueue(

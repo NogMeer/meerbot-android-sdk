@@ -1,6 +1,7 @@
 package ru.meerbot.sdk.network
 
 import org.json.JSONObject
+import ru.meerbot.sdk.state.Attachment
 import ru.meerbot.sdk.state.ChatMode
 
 /**
@@ -93,12 +94,15 @@ sealed class ChatStreamEvent {
 
                 "manager_message" -> {
                     val text = json?.optString("text").orEmpty()
-                    if (text.isEmpty()) null else Manager(
+                    val attachments = parseAttachments(json?.optJSONArray("attachments"))
+                    // Ответ менеджера может нести ТОЛЬКО вложение (текст пустой) — тогда его тоже
+                    // показываем. Пусто и без вложений — служебный кадр, пропускаем.
+                    if (text.isEmpty() && attachments.isEmpty()) null else Manager(
                         ManagerMessage(
                             messageId = json?.optLong("messageId", 0L) ?: 0L,
                             text = text,
                             authorName = json?.optStringOrNull("authorName"),
-                        )
+                        ).apply { this.attachments = attachments }
                     )
                 }
 
@@ -139,4 +143,12 @@ data class ManagerMessage(
     val messageId: Long,
     val text: String,
     val authorName: String?,
-)
+) {
+    /**
+     * Вложения ответа. В ТЕЛЕ класса, а не в конструкторе: `equals`/`copy`/`componentN`
+     * data-класса их не видят, и приложение, собранное против 0.3.0, не получает
+     * `NoSuchMethodError` на обновлении. Тот же приём, что у полей подтверждения в [Meta].
+     */
+    var attachments: List<Attachment> = emptyList()
+        internal set
+}

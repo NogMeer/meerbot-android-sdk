@@ -21,6 +21,22 @@
                 android:name="ru.meerbot.sdk.internal.MeerBotInitializer"
                 android:value="androidx.startup" />
         </provider>
+
+        <!--
+            Открытие скачанного вложения системным просмотрщиком: файл кладётся в приватный
+            cacheDir и отдаётся по content://-Uri через FileProvider. Authority с суффиксом
+            .meerbot.fileprovider не конфликтует с провайдером хоста. Разрешений на хранилище
+            SDK не просит — файл приватный, наружу уходит только временный грант чтения.
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.meerbot.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/meerbot_file_paths" />
+        </provider>
     </application>
 
 </manifest>

@@ -82,6 +82,10 @@ dependencies {
     // lifecycle-process), объявлена явно по той же причине, что корутины и lifecycle выше.
     implementation("androidx.startup:startup-runtime:1.1.1")
 
+    // FileProvider для открытия скачанного вложения системным просмотрщиком. Объявлено ЯВНО:
+    // класс уже приезжает транзитивом (activity/lifecycle → core), но SDK на него опирается сам.
+    implementation("androidx.core:core:1.12.0")
+
     // Networking
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.squareup.okhttp3:okhttp-sse:4.12.0")

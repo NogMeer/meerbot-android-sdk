@@ -33,4 +33,17 @@
 
     <string name="meerbot_not_configured_title">MeerBot is not configured</string>
     <string name="meerbot_not_configured_body">Call MeerBot.configure(context, apiKey) on app start.</string>
+
+    <!-- Attachments -->
+    <string name="meerbot_attach">Attach file</string>
+    <string name="meerbot_attach_media">Photo &amp; video</string>
+    <string name="meerbot_attach_file">File</string>
+    <string name="meerbot_attach_remove">Remove attachment</string>
+    <string name="meerbot_attach_limit">You can attach up to %1$d files</string>
+    <string name="meerbot_attach_read_failed">Could not read the file. Please try again.</string>
+    <string name="meerbot_attachment_generic">Attachment</string>
+    <string name="meerbot_attachment_image">Image</string>
+    <string name="meerbot_attachment_file">File: %1$s</string>
+    <string name="meerbot_attachment_download_failed">Could not download the file. Please try again.</string>
+    <string name="meerbot_attachment_no_viewer">No app available to open this file.</string>
 </resources>

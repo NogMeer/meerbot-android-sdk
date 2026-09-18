@@ -32,6 +32,13 @@ data class ChatMessage(
      * Параметр последний в списке: позиционные вызовы у хостов не должны сломаться.
      */
     val serverId: Long? = null,
+    /**
+     * Вложения сообщения. Последний параметр по той же причине, что [serverId]: позиционные
+     * вызовы хостов не должны сломаться. У отправленного пользователем сообщения до
+     * подтверждения историей — локальные (`mediaId` с префиксом [Attachment.LOCAL_PREFIX],
+     * байты в [LocalMediaCache]); у серверных строк — с настоящим `mediaId`.
+     */
+    val attachments: List<Attachment> = emptyList(),
 )
 
 enum class ChatMode(val raw: String) {
@@ -188,8 +195,8 @@ class ChatStore {
         return messages.any { (it.serverId ?: 0L) > serverId }
     }
 
-    fun appendUserMessage(content: String): ChatMessage {
-        val msg = ChatMessage(role = "user", content = content)
+    fun appendUserMessage(content: String, attachments: List<Attachment> = emptyList()): ChatMessage {
+        val msg = ChatMessage(role = "user", content = content, attachments = attachments)
         _state.update { it.copy(messages = it.messages + msg) }
         rememberEchoFloor(msg.id)
         return msg
@@ -238,12 +245,17 @@ class ChatStore {
         )
     }
 
-    fun appendOperatorMessage(content: String, authorName: String?) {
+    fun appendOperatorMessage(
+        content: String,
+        authorName: String?,
+        attachments: List<Attachment> = emptyList(),
+    ) {
         val msg = ChatMessage(
             role = "assistant",
             author = "manager",
             authorName = authorName,
             content = content,
+            attachments = attachments,
         )
         _state.update { it.copy(messages = it.messages + msg) }
         rememberEchoFloor(msg.id)
@@ -480,6 +492,7 @@ class ChatStore {
         _state.value = ChatState()
         echoFloors.clear()
         idConfirmed.clear()
+        LocalMediaCache.clear()
     }
 
     /**
@@ -491,6 +504,7 @@ class ChatStore {
         _state.update { ChatState(greeting = it.greeting) }
         echoFloors.clear()
         idConfirmed.clear()
+        LocalMediaCache.clear()
     }
 
     /**

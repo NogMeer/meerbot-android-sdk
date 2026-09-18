@@ -1,6 +1,12 @@
 package ru.meerbot.sdk.ui
 
+import android.net.Uri
+import android.provider.OpenableColumns
 import android.provider.Settings
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
@@ -14,6 +20,8 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -46,6 +54,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.LineHeightStyle
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.takeOrElse
 import androidx.compose.ui.unit.sp
@@ -53,9 +62,13 @@ import ru.meerbot.sdk.R
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import ru.meerbot.sdk.state.ChatController
 import ru.meerbot.sdk.state.ChatMessage
 import ru.meerbot.sdk.state.ChatMode
+import ru.meerbot.sdk.state.OutgoingAttachment
 
 /**
  * Экран чата. Контракт совпадает с iOS ChatView.
@@ -84,6 +97,60 @@ fun ChatScreen(
     val listState = rememberLazyListState()
     val accent = primaryColor ?: MaterialTheme.colorScheme.primary
     val listDescription = stringResource(R.string.meerbot_messages_list)
+
+    // ─── Вложения композера ───────────────────────────────────────────────────────────────
+    val context = LocalContext.current
+    val chatScope = rememberCoroutineScope()
+    // Выбранные, но ещё не отправленные файлы. `remember`, а не `rememberSaveable`: Uri из
+    // пикера действителен, пока живёт процесс; при пересоздании экрана выбор проще повторить,
+    // чем восстанавливать разрешение на Uri.
+    var pending by remember { mutableStateOf<List<PendingAttachment>>(emptyList()) }
+    val limitToast = stringResource(R.string.meerbot_attach_limit, ChatController.MAX_ATTACHMENTS)
+    val readFailedToast = stringResource(R.string.meerbot_attach_read_failed)
+
+    fun addPicked(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        val remaining = ChatController.MAX_ATTACHMENTS - pending.size
+        if (remaining <= 0) {
+            Toast.makeText(context, limitToast, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val accepted = uris.take(remaining).map { readAttachmentMeta(context, it) }
+        pending = pending + accepted
+        // Выбрали больше, чем влезает — честно говорим, а не отбрасываем молча.
+        if (uris.size > remaining) Toast.makeText(context, limitToast, Toast.LENGTH_SHORT).show()
+    }
+
+    // Photo Picker: картинки и видео без разрешений (Android 13+ и системный бэкпорт).
+    val pickMedia = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickMultipleVisualMedia(ChatController.MAX_ATTACHMENTS),
+    ) { uris -> addPicked(uris) }
+    // Прочие файлы: system picker, тоже без разрешений на чтение хранилища.
+    val pickFile = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetContent(),
+    ) { uri -> uri?.let { addPicked(listOf(it)) } }
+
+    fun submit() {
+        val text = state.draft
+        val picks = pending.toList()
+        if (picks.isEmpty()) {
+            controller.send(text)
+            return
+        }
+        chatScope.launch {
+            val outgoing = withContext(Dispatchers.IO) {
+                picks.map { p -> readOutgoing(context, p) }
+            }
+            // Хоть один файл не прочитался (отозван доступ, слишком большой) — не отправляем
+            // ничего: текст и вложения не теряем, показываем ошибку, повтор — ещё один тап Send.
+            if (outgoing.any { it == null }) {
+                Toast.makeText(context, readFailedToast, Toast.LENGTH_LONG).show()
+                return@launch
+            }
+            controller.send(text, outgoing.filterNotNull())
+            pending = emptyList()
+        }
+    }
 
     // Протягивание переписки убирает клавиатуру — так ведёт себя любой мессенджер, и без
     // этого выйти из ввода нечем: своей кнопки «Готово» у поля нет, а хост-приложение
@@ -229,7 +296,7 @@ fun ChatScreen(
                     contentPadding = PaddingValues(vertical = 8.dp),
                 ) {
                     items(state.messages, key = { it.id }) { message ->
-                        MessageBubble(message = message, accent = accent)
+                        MessageBubble(controller = controller, message = message, accent = accent)
                     }
                 }
             }
@@ -255,10 +322,29 @@ fun ChatScreen(
             sending = state.sending,
             closed = state.mode == ChatMode.Closed,
             accent = accent,
+            pending = pending,
+            canAttach = pending.size < ChatController.MAX_ATTACHMENTS,
             onDraftChange = controller::setDraft,
-            onSend = controller::send,
+            onPickMedia = {
+                pickMedia.launch(
+                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo),
+                )
+            },
+            onPickFile = { pickFile.launch("*/*") },
+            onRemovePending = { p -> pending = pending.filterNot { it === p } },
+            onSend = { submit() },
         )
     }
+}
+
+/** Выбранный, но ещё не загруженный файл: только Uri и метаданные для чипа. Байты читаются на Send. */
+private data class PendingAttachment(
+    val uri: Uri,
+    val fileName: String,
+    val size: Long,
+    val mime: String,
+) {
+    val isImage: Boolean get() = mime.startsWith("image/")
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -302,7 +388,7 @@ private fun EmptyState(text: String) {
 }
 
 @Composable
-private fun MessageBubble(message: ChatMessage, accent: Color) {
+private fun MessageBubble(controller: ChatController, message: ChatMessage, accent: Color) {
     val isUser = message.role == "user"
     val bubbleColor = if (isUser) accent else MaterialTheme.colorScheme.surfaceVariant
     val textColor =
@@ -311,12 +397,20 @@ private fun MessageBubble(message: ChatMessage, accent: Color) {
         if (isUser) R.string.meerbot_message_from_you else R.string.meerbot_message_from_bot
     )
     val notDelivered = stringResource(R.string.meerbot_not_delivered)
-    // Пузырь читается вслух одной репликой: «Ваше сообщение: …», а не по кускам. Недоставку
-    // включаем в ту же реплику — иначе о ней узнают только зрячие.
+    val attachmentLabel = stringResource(R.string.meerbot_attachment_generic)
+    val hasText = message.content.isNotEmpty()
+    // Пузырь читается вслух одной репликой: «Ваше сообщение: …», а не по кускам. Вложения и
+    // недоставку включаем в ту же реплику — иначе о них узнают только зрячие.
     val bubbleDescription = buildString {
         append(roleDescription)
         append(": ")
-        append(message.content)
+        if (hasText) append(message.content)
+        message.attachments.forEach {
+            if (isNotEmpty() && last() != ' ') append(" ")
+            append(attachmentLabel)
+            append(" ")
+            append(it.fileName)
+        }
         if (message.failed) {
             append(", ")
             append(notDelivered)
@@ -355,16 +449,26 @@ private fun MessageBubble(message: ChatMessage, accent: Color) {
                     )
                     Spacer(modifier = Modifier.height(2.dp))
                 }
-                if (message.streaming && message.content.isEmpty()) {
+                if (message.attachments.isNotEmpty()) {
+                    MessageAttachments(
+                        controller = controller,
+                        message = message,
+                        onSurface = textColor,
+                        accent = accent,
+                    )
+                    if (hasText || message.streaming) Spacer(modifier = Modifier.height(6.dp))
+                }
+                if (message.streaming && message.content.isEmpty() && message.attachments.isEmpty()) {
                     // Модель ещё думает — текста нет вовсе. Раньше здесь оставался ОДИН
                     // символ `▍`, и пузырь выглядел как обрывок непонятного глифа: человек
                     // не понимал, ответ это или сбой. Три пульсирующие точки — то, чем
                     // «собеседник печатает» показывают все мессенджеры, объяснять их не надо.
                     TypingDots()
-                } else {
+                } else if (hasText || message.streaming) {
                     // Текст уже пошёл — курсор в конце строки читается как курсор (так
                     // делают ChatGPT и Claude), но ТОЛЬКО мигающий: статичный символ в
-                    // конце ответа неотличим от опечатки бота.
+                    // конце ответа неотличим от опечатки бота. Пустой текст при непустом
+                    // вложении (сообщение только с файлом) строку не рисует вовсе.
                     val cursor = if (message.streaming && blinkVisible()) "▍" else ""
                     Text(
                         message.content + cursor,
@@ -477,10 +581,15 @@ private fun ChatInput(
     sending: Boolean,
     closed: Boolean,
     accent: Color,
+    pending: List<PendingAttachment>,
+    canAttach: Boolean,
     onDraftChange: (String) -> Unit,
-    onSend: (String) -> Unit,
+    onPickMedia: () -> Unit,
+    onPickFile: () -> Unit,
+    onRemovePending: (PendingAttachment) -> Unit,
+    onSend: () -> Unit,
 ) {
-    val canSend = draft.isNotBlank() && !sending && !closed
+    val canSend = (draft.isNotBlank() || pending.isNotEmpty()) && !sending && !closed
 
     // Вертикальную метрику поле ввода задаёт САМО, а не берёт из typography хоста. Высота
     // каретки в BasicTextField равна высоте строки, а высота строки по умолчанию — метрики
@@ -500,15 +609,29 @@ private fun ChatInput(
         ),
     )
 
-    Row(
+    Column(
         modifier = Modifier
             .fillMaxWidth()
             .background(MaterialTheme.colorScheme.surface)
             .navigationBarsPadding()
-            .imePadding()
+            .imePadding(),
+    ) {
+        if (pending.isNotEmpty()) {
+            PendingAttachmentsStrip(pending = pending, onRemove = onRemovePending)
+        }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
             .padding(8.dp),
         verticalAlignment = Alignment.Bottom,
     ) {
+        AttachButton(
+            enabled = canAttach && !sending && !closed,
+            accent = accent,
+            onPickMedia = onPickMedia,
+            onPickFile = onPickFile,
+        )
+        Spacer(modifier = Modifier.width(4.dp))
         // Пилюля и её минимальная высота живут на РОДИТЕЛЕ, а поле центрируется внутри.
         // Когда `heightIn(min = 48.dp)` стоял на самом BasicTextField, поле растягивалось до
         // 48dp, но текст оставался наверху — остаток высоты уходил целиком под строку, и она
@@ -553,7 +676,7 @@ private fun ChatInput(
         }
         Spacer(modifier = Modifier.width(8.dp))
         FilledIconButton(
-            onClick = { if (canSend) onSend(draft) },
+            onClick = { if (canSend) onSend() },
             enabled = canSend,
             modifier = Modifier.size(48.dp),
             colors = IconButtonDefaults.filledIconButtonColors(
@@ -564,6 +687,132 @@ private fun ChatInput(
             Icon(Icons.Default.Send, contentDescription = stringResource(R.string.meerbot_send))
         }
     }
+    }
+}
+
+/** Кнопка-скрепка с меню выбора источника: «Фото и видео» (Photo Picker) или «Файл». */
+@Composable
+private fun AttachButton(
+    enabled: Boolean,
+    accent: Color,
+    onPickMedia: () -> Unit,
+    onPickFile: () -> Unit,
+) {
+    var menuOpen by remember { mutableStateOf(false) }
+    Box {
+        IconButton(
+            onClick = { menuOpen = true },
+            enabled = enabled,
+            modifier = Modifier.size(48.dp),
+        ) {
+            Icon(
+                imageVector = remember { attachIcon() },
+                contentDescription = stringResource(R.string.meerbot_attach),
+                tint = if (enabled) accent else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
+            )
+        }
+        DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+            DropdownMenuItem(
+                text = { Text(stringResource(R.string.meerbot_attach_media)) },
+                onClick = {
+                    menuOpen = false
+                    onPickMedia()
+                },
+            )
+            DropdownMenuItem(
+                text = { Text(stringResource(R.string.meerbot_attach_file)) },
+                onClick = {
+                    menuOpen = false
+                    onPickFile()
+                },
+            )
+        }
+    }
+}
+
+/** Горизонтальная лента чипов выбранных вложений над полем ввода. */
+@Composable
+private fun PendingAttachmentsStrip(
+    pending: List<PendingAttachment>,
+    onRemove: (PendingAttachment) -> Unit,
+) {
+    val removeLabel = stringResource(R.string.meerbot_attach_remove)
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState())
+            .padding(horizontal = 8.dp, vertical = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        pending.forEach { item ->
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
+                    .padding(start = 10.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.widthIn(max = 160.dp)) {
+                    Text(
+                        item.fileName,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        style = MaterialTheme.typography.labelMedium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    if (item.size > 0) {
+                        Text(
+                            humanSize(item.size),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                    }
+                }
+                IconButton(onClick = { onRemove(item) }, modifier = Modifier.size(28.dp)) {
+                    Icon(
+                        Icons.Default.Close,
+                        contentDescription = removeLabel,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(16.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
+// ─── Чтение выбранных файлов ─────────────────────────────────────────────────────────────────
+
+/** Потолок чтения одного файла в память (25 МБ): защита от OOM на гигантском видео. */
+private const val MAX_ATTACHMENT_BYTES = 25L * 1024 * 1024
+
+/** Метаданные файла из `ContentResolver` для чипа (имя, размер, mime). Быстро, на главном потоке. */
+private fun readAttachmentMeta(context: android.content.Context, uri: Uri): PendingAttachment {
+    val resolver = context.contentResolver
+    val mime = resolver.getType(uri) ?: "application/octet-stream"
+    var name = uri.lastPathSegment?.substringAfterLast('/') ?: "file"
+    var size = 0L
+    runCatching {
+        resolver.query(uri, null, null, null, null)?.use { c ->
+            if (c.moveToFirst()) {
+                val nameIdx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (nameIdx >= 0 && !c.isNull(nameIdx)) name = c.getString(nameIdx)
+                val sizeIdx = c.getColumnIndex(OpenableColumns.SIZE)
+                if (sizeIdx >= 0 && !c.isNull(sizeIdx)) size = c.getLong(sizeIdx)
+            }
+        }
+    }
+    return PendingAttachment(uri = uri, fileName = name, size = size, mime = mime)
+}
+
+/** Прочитать байты файла для загрузки. `null` — доступ отозван, ошибка чтения или файл больше [MAX_ATTACHMENT_BYTES]. */
+private fun readOutgoing(context: android.content.Context, pending: PendingAttachment): OutgoingAttachment? {
+    if (pending.size > MAX_ATTACHMENT_BYTES) return null
+    val bytes = runCatching {
+        context.contentResolver.openInputStream(pending.uri)?.use { it.readBytes() }
+    }.getOrNull() ?: return null
+    if (bytes.size > MAX_ATTACHMENT_BYTES) return null
+    return OutgoingAttachment(bytes = bytes, fileName = pending.fileName, mime = pending.mime)
 }
 
 /** Системная настройка «убрать анимации» (Специальные возможности → Удалить анимацию). */

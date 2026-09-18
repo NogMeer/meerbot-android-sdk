@@ -19,10 +19,14 @@ import kotlinx.coroutines.withContext
 import okhttp3.Call
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
+import ru.meerbot.sdk.state.Attachment
 import ru.meerbot.sdk.state.ChatMode
 import java.io.IOException
 import java.text.SimpleDateFormat
@@ -74,6 +78,14 @@ data class HistoryMessage(
      * конструктора публичного data-класса сломал бы приложения, собранные против 0.2.8.
      */
     var clientMessageId: String? = null
+        internal set
+
+    /**
+     * Вложения строки. В теле класса, а не в конструкторе, — по той же причине, что
+     * [clientMessageId]: новый параметр конструктора публичного data-класса сломал бы
+     * приложения, собранные против прежней версии.
+     */
+    var attachments: List<Attachment> = emptyList()
         internal set
 }
 
@@ -575,6 +587,7 @@ class ApiClient internal constructor(
                     clientIdsSupported = true
                     clientMessageId = item.optStringOrNull("clientMessageId")?.lowercase()
                 }
+                attachments = parseAttachments(item.optJSONArray("attachments"))
             }
         }
         // Страница, запрошенная до смены человека, курсор нового не двигает.
@@ -590,6 +603,49 @@ class ApiClient internal constructor(
         ).apply { clientMessageIdsSupported = clientIdsSupported }
     }
 
+    // ─── Вложения ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Загрузить файл в канал: `POST /api/v1/mobile/upload`, multipart, поле `file`. Возвращает
+     * [UploadResult] с `uploadId` для последующей отправки сообщения. 401 по протухшему JWT
+     * обновляет сессию и повторяется один раз (как у истории). Байты в лог НЕ уходят.
+     *
+     * Отказы канала: 415 `mime_not_allowed`, 400 `file_required`/`media_invalid`,
+     * 429 `upload_rate_limited` — приходят той же формой `{error:{code,message}}` и превращаются
+     * в [MeerBotError.Http] с машинным кодом.
+     */
+    suspend fun uploadAttachment(bytes: ByteArray, fileName: String, mime: String): UploadResult {
+        val mediaType = mime.toMediaTypeOrNull() ?: "application/octet-stream".toMediaType()
+        val json = executeAuthorizedJson { token ->
+            val body = MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart("file", fileName, bytes.toRequestBody(mediaType))
+                .build()
+            newRequest("/api/v1/mobile/upload")
+                .post(body)
+                .header("Authorization", "Bearer $token")
+                .build()
+        }
+        return UploadResult.from(json)
+    }
+
+    /**
+     * Скачать байты медиа: `GET /api/v1/mobile/media/<messageId>/<mediaId>` с Bearer. Для
+     * отрисовки картинки в ленте. 401 обновляет сессию и повторяется один раз.
+     */
+    suspend fun fetchMedia(messageId: Long, mediaId: String): ByteArray {
+        val url = (config.baseUrl.trimEnd('/') + "/api/v1/mobile/media/$messageId/$mediaId")
+            .toHttpUrl()
+        return executeAuthorizedBytes { token ->
+            Request.Builder()
+                .url(url)
+                .get()
+                .applyCommonHeaders()
+                .header("Authorization", "Bearer $token")
+                .build()
+        }
+    }
+
     // ─── Стрим ответа ─────────────────────────────────────────────────────────────────────
 
     /**
@@ -601,17 +657,30 @@ class ApiClient internal constructor(
      * запрос повторяется РОВНО один раз; 403 `channel_mismatch` не повторяется никогда —
      * перепутан ключ, и новый токен будет ровно таким же.
      */
-    fun sendMessage(text: String): Flow<ChatStreamEvent> = sendMessage(text, clientMessageId = null)
+    fun sendMessage(text: String): Flow<ChatStreamEvent> =
+        sendMessage(text, clientMessageId = null, uploadIds = emptyList())
 
     /**
      * Отправка с `clientMessageId` — идемпотентная: сервер не сохранит сообщение с этим id
      * дважды и не сгенерирует второй ответ, а на повтор отдаст уже готовый (`meta.replayed`).
      * Id уходит и в повтор после переподключения. `null` — прежний, неидемпотентный путь.
      */
-    internal fun sendMessage(text: String, clientMessageId: String?): Flow<ChatStreamEvent> = flow {
+    internal fun sendMessage(text: String, clientMessageId: String?): Flow<ChatStreamEvent> =
+        sendMessage(text, clientMessageId, uploadIds = emptyList())
+
+    /**
+     * Отправка с вложениями: [uploadIds] — идентификаторы из [uploadAttachment] (≤10). `message`
+     * может быть пустым при непустом [uploadIds]. Пустой список — тело как раньше, без поля.
+     */
+    internal fun sendMessage(
+        text: String,
+        clientMessageId: String?,
+        uploadIds: List<String>,
+    ): Flow<ChatStreamEvent> = flow {
         runStream(
             text = text,
             clientMessageId = clientMessageId,
+            uploadIds = uploadIds,
             allowReauthorize = true,
             allowUnavailableRetry = true,
             collector = this,
@@ -634,6 +703,7 @@ class ApiClient internal constructor(
     private suspend fun runStream(
         text: String,
         clientMessageId: String?,
+        uploadIds: List<String>,
         allowReauthorize: Boolean,
         allowUnavailableRetry: Boolean,
         collector: FlowCollector<ChatStreamEvent>,
@@ -641,6 +711,7 @@ class ApiClient internal constructor(
     ) {
         val body = JSONObject().put("message", text)
         clientMessageId?.let { body.put("clientMessageId", it) }
+        if (uploadIds.isNotEmpty()) body.put("uploadIds", JSONArray(uploadIds))
 
         val request = newRequest("/api/v1/mobile/chat/stream")
             .post(body.toString().toRequestBody(JSON))
@@ -694,11 +765,11 @@ class ApiClient internal constructor(
             null -> Unit
             StreamRetry.Reauthorize -> {
                 invalidateToken()
-                runStream(text, clientMessageId, allowReauthorize = false, allowUnavailableRetry, collector, startedIn)
+                runStream(text, clientMessageId, uploadIds, allowReauthorize = false, allowUnavailableRetry, collector, startedIn)
             }
             is StreamRetry.Unavailable -> {
                 unavailableRetryDelay(retry.delayMs)
-                runStream(text, clientMessageId, allowReauthorize, allowUnavailableRetry = false, collector, startedIn)
+                runStream(text, clientMessageId, uploadIds, allowReauthorize, allowUnavailableRetry = false, collector, startedIn)
             }
         }
     }
@@ -790,6 +861,33 @@ class ApiClient internal constructor(
             if (!e.isExpiredToken) throw e
             invalidateToken()
             executeJson(build(validToken()))
+        }
+    }
+
+    /** Скачать тело как байты; 401 по протухшему JWT обновляет сессию и повторяется один раз. */
+    private suspend fun executeAuthorizedBytes(build: (String) -> Request): ByteArray {
+        return try {
+            executeBytes(build(validToken()))
+        } catch (e: MeerBotError) {
+            if (!e.isExpiredToken) throw e
+            invalidateToken()
+            executeBytes(build(validToken()))
+        }
+    }
+
+    private suspend fun executeBytes(request: Request): ByteArray = withContext(Dispatchers.IO) {
+        val response = try {
+            httpClient.newCall(request).execute()
+        } catch (e: IOException) {
+            throw MeerBotError.Network(e.message ?: "io")
+        }
+        response.use {
+            if (!it.isSuccessful) throw decodeError(it.code, it.body?.string())
+            try {
+                it.body?.bytes() ?: throw MeerBotError.InvalidResponse
+            } catch (e: IOException) {
+                throw MeerBotError.Network(e.message ?: "io")
+            }
         }
     }
 
