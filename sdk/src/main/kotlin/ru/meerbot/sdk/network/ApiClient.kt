@@ -549,13 +549,18 @@ class ApiClient internal constructor(
     /**
      * История диалога. Диалог сервер резолвит по устройству из токена — передавать его id
      * клиенту нечем и незачем.
+     *
+     * Окно: без курсоров — хвост треда; [since] — новее (догон); [before] — старее (подгрузка
+     * при прокрутке вверх). Курсоры взаимоисключающие. Страница всегда по возрастанию id.
      */
-    suspend fun history(since: Long? = null, limit: Int = 50): HistoryPage {
+    suspend fun history(since: Long? = null, before: Long? = null, limit: Int = 50): HistoryPage {
+        require(since == null || before == null) { "since и before взаимоисключающие" }
         val startedIn = currentGeneration()
         val url = (config.baseUrl.trimEnd('/') + "/api/v1/mobile/messages").toHttpUrl()
             .newBuilder()
             .addQueryParameter("limit", limit.toString())
             .apply { if (since != null) addQueryParameter("since", since.toString()) }
+            .apply { if (before != null) addQueryParameter("before", before.toString()) }
             .build()
 
         val json = executeAuthorizedJson { token ->
@@ -590,9 +595,12 @@ class ApiClient internal constructor(
                 attachments = parseAttachments(item.optJSONArray("attachments"))
             }
         }
-        // Страница, запрошенная до смены человека, курсор нового не двигает.
-        messages.lastOrNull()?.let { last ->
-            synchronized(sessionLock) { if (generation == startedIn) lastMessageId = last.id }
+        // Страница, запрошенная до смены человека, курсор нового не двигает. Страница старых
+        // (`before`) — тоже: курсор догона — самое новое сообщение, а не последнее прочитанное.
+        if (before == null) {
+            messages.lastOrNull()?.let { last ->
+                synchronized(sessionLock) { if (generation == startedIn) lastMessageId = last.id }
+            }
         }
         // Режим приходит той же страницей: только так клиент узнаёт, что диалог закрыт или
         // уже ведёт менеджер, — рукопожатие канала режима не отдаёт.

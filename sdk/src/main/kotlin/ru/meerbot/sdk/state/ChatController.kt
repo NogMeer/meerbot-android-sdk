@@ -78,6 +78,12 @@ class ChatController(
         var idlePollIntervalMs = 12_000L
         /** Потолок страниц за один догон: цикл не имеет права стать бесконечным. */
         const val MAX_CATCH_UP_PAGES = 5
+        /**
+         * Стартовый хвост ленты: экран открывается с последними сообщениями, а не ждёт всю
+         * переписку. Остальное — страницами [OLDER_PAGE_LIMIT] при прокрутке вверх.
+         */
+        const val INITIAL_HISTORY_LIMIT = 3
+        const val OLDER_PAGE_LIMIT = 20
         /** Потолок вложений на сообщение — контракт бэкенда (`uploadIds[] ≤ 10`). */
         const val MAX_ATTACHMENTS = 10
 
@@ -344,6 +350,12 @@ class ChatController(
                 }
                 store.setMode(response.mode)
                 mergeHistory(historyBatch(response))
+                // Без курсора сервер отдал хвост: `hasMore` значит «выше есть старее», а не
+                // «догоняй дальше» — новее хвоста ничего нет, а старое подгрузит прокрутка.
+                if (cursor <= 0L) {
+                    store.setHasOlder(response.hasMore)
+                    break
+                }
                 if (!response.hasMore) break
             }
             // Баннер снимаем, только если повторять нечего: иначе с экрана исчезла бы кнопка
@@ -655,8 +667,43 @@ class ChatController(
      * сохраняет неподтверждённые строки, узнаёт эхо своих и ставит историю над ними.
      */
     private suspend fun loadHistory() {
-        val batch = fetchHistory() ?: return
+        val batch = fetchHistory(INITIAL_HISTORY_LIMIT) ?: return
         mergeHistory(batch)
+        store.setHasOlder(batch.hasMore)
+    }
+
+    /**
+     * Подгрузить страницу более старых сообщений — экран зовёт, когда пользователь докрутил
+     * до начала ленты. Курсор догона не трогает: страница старее всего, что уже в ленте.
+     * Ошибка не роняет экран — ставит `olderFailed`, и экран предлагает «Повторить».
+     */
+    @MainThread
+    fun loadOlder() {
+        val state = store.state.value
+        if (!state.ready || !state.hasOlder || state.loadingOlder) return
+        val before = store.oldestServerMessageId ?: return
+        val startedEpoch = identityEpoch.get()
+        val revision = client.deviceRevision
+        store.setLoadingOlder(true)
+        scope.launch {
+            try {
+                val page = client.history(before = before, limit = OLDER_PAGE_LIMIT)
+                // Сменился пользователь или устройство — страница от чужого треда.
+                if (identityEpoch.get() != startedEpoch || client.deviceRevision != revision) {
+                    store.setLoadingOlder(false)
+                    return@launch
+                }
+                mergeHistory(historyBatch(page))
+                store.setHasOlder(page.hasMore)
+                store.setLoadingOlder(false)
+            } catch (e: CancellationException) {
+                store.setLoadingOlder(false)
+                throw e
+            } catch (e: Throwable) {
+                if (identityEpoch.get() != startedEpoch) return@launch
+                store.setLoadingOlder(false, failed = true)
+            }
+        }
     }
 
     /**
@@ -684,9 +731,9 @@ class ChatController(
      * Хвост треда с сервера (без курсора) — для слияния с лентой при старте и после обрыва.
      * `null` — пока шёл запрос, сменился пользователь, и страница принадлежит прежнему.
      */
-    private suspend fun fetchHistory(): HistoryBatch? {
+    private suspend fun fetchHistory(limit: Int = 50): HistoryBatch? {
         val startedEpoch = identityEpoch.get()
-        val page = client.history()
+        val page = client.history(limit = limit)
         if (identityEpoch.get() != startedEpoch) return null
         // Страница — уже от текущего устройства (запрос без курсора), поэтому серверные строки
         // прежнего треда убираются перед слиянием, а не после.
@@ -700,9 +747,11 @@ class ChatController(
         val items: List<ChatMessage>,
         val clientIds: Map<Long, String>,
         val clientIdsSupported: Boolean,
+        val hasMore: Boolean,
     )
 
     private fun historyBatch(page: HistoryPage) = HistoryBatch(
+        hasMore = page.hasMore,
         items = mapHistory(page.messages),
         clientIds = page.messages.mapNotNull { item ->
             item.clientMessageId?.let { item.id to it }

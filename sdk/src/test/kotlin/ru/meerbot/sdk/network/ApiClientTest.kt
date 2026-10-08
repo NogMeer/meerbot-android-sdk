@@ -977,6 +977,26 @@ class ApiClientTest {
     }
 
     @Test
+    fun `страница старых по before не двигает курсор догона`() = runBlocking {
+        server.enqueue(registerResponse())
+        server.enqueue(MockResponse().setBody("""{"messages":[{"id":20,"role":"user","content":"новое","createdAt":"2026-08-14T10:00:00.000Z"}],"hasMore":true,"mode":"ai"}"""))
+        server.enqueue(MockResponse().setBody("""{"messages":[{"id":5,"role":"user","content":"старое","createdAt":"2026-08-13T10:00:00.000Z"}],"hasMore":false,"mode":"ai"}"""))
+        val api = client()
+
+        api.history(limit = 3)
+        val older = api.history(before = 20, limit = 20)
+
+        assertEquals(5L, older.messages.single().id)
+        assertEquals(20L, api.lastMessageId)
+        server.takeRequest()
+        assertTrue(server.takeRequest().path!!.contains("limit=3"))
+        val olderPath = server.takeRequest().path!!
+        assertTrue(olderPath.contains("before=20"))
+        assertTrue(olderPath.contains("limit=20"))
+        assertTrue(!olderPath.contains("since"))
+    }
+
+    @Test
     fun `пустая история — не ошибка`() = runBlocking {
         server.enqueue(registerResponse())
         server.enqueue(MockResponse().setBody("""{"messages":[],"hasMore":false,"mode":"ai"}"""))

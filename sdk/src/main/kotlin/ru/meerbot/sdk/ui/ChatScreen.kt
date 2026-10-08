@@ -206,7 +206,9 @@ fun ChatScreen(
     // с нуля, и мгновенный прыжок вниз там снова уместен.
     var didInitialScroll by remember { mutableStateOf(false) }
 
-    LaunchedEffect(state.messages.size, state.messages.lastOrNull()?.content) {
+    // Ключ — ПОСЛЕДНЕЕ сообщение, а не размер ленты: подгрузка старых сверху меняет размер,
+    // но не должна сбрасывать читающего историю вниз.
+    LaunchedEffect(state.messages.lastOrNull()?.id, state.messages.lastOrNull()?.content) {
         if (state.messages.isEmpty()) return@LaunchedEffect
         val lastIndex = state.messages.size - 1
         if (didInitialScroll) {
@@ -216,6 +218,17 @@ fun ChatScreen(
             // Без анимации — экран должен ОТКРЫТЬСЯ внизу, а не доехать туда.
             listState.scrollToItem(lastIndex)
         }
+    }
+
+    // Подгрузка старых: верх ленты (первые [OLDER_PREFETCH_ITEMS] строк) в зоне видимости.
+    // Позицию при вставке сверху держит сам LazyColumn — строки с ключами, первая видимая
+    // остаётся на месте. Эффект перезапускается по окончании загрузки: если лента всё ещё
+    // короче экрана (верх виден), грузится следующая страница. После ошибки — только по
+    // «Повторить», автоповтора нет.
+    LaunchedEffect(listState, didInitialScroll, state.hasOlder, state.loadingOlder, state.olderFailed) {
+        if (!didInitialScroll || !state.hasOlder || state.loadingOlder || state.olderFailed) return@LaunchedEffect
+        snapshotFlow { listState.firstVisibleItemIndex }
+            .collect { first -> if (first < OLDER_PREFETCH_ITEMS) controller.loadOlder() }
     }
 
     // Лента едет ВМЕСТЕ с клавиатурой, кадр в кадр.
@@ -299,6 +312,14 @@ fun ChatScreen(
                         MessageBubble(controller = controller, message = message, accent = accent)
                     }
                 }
+                // Статус подгрузки — поверх ленты, а не строкой списка: строка сдвигала бы
+                // индексы, к которым привязаны доскролл и сдвиг под клавиатуру.
+                OlderHistoryStatus(
+                    loading = state.loadingOlder,
+                    failed = state.olderFailed,
+                    onRetry = controller::loadOlder,
+                    modifier = Modifier.align(Alignment.TopCenter).padding(top = 8.dp),
+                )
             }
         }
 
@@ -846,5 +867,38 @@ private fun animationsDisabled(): Boolean {
             Settings.Global.ANIMATOR_DURATION_SCALE,
             1f,
         ) == 0f
+    }
+}
+
+/** Сколько первых строк ленты считаются «верхом» — подгрузка стартует заранее, до упора. */
+private const val OLDER_PREFETCH_ITEMS = 3
+
+@Composable
+private fun OlderHistoryStatus(
+    loading: Boolean,
+    failed: Boolean,
+    onRetry: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    if (!loading && !failed) return
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(16.dp),
+        tonalElevation = 2.dp,
+        shadowElevation = 1.dp,
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (loading) {
+                CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(8.dp))
+                Text(stringResource(R.string.meerbot_loading_older), style = MaterialTheme.typography.labelMedium)
+            } else {
+                Text(stringResource(R.string.meerbot_older_failed), style = MaterialTheme.typography.labelMedium)
+                TextButton(onClick = onRetry) { Text(stringResource(R.string.meerbot_retry)) }
+            }
+        }
     }
 }

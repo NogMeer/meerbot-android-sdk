@@ -46,4 +46,6 @@
     <string name="meerbot_attachment_file">File: %1$s</string>
     <string name="meerbot_attachment_download_failed">Could not download the file. Please try again.</string>
     <string name="meerbot_attachment_no_viewer">No app available to open this file.</string>
+    <string name="meerbot_loading_older">Loading earlier messages…</string>
+    <string name="meerbot_older_failed">Couldn’t load earlier messages</string>
 </resources>

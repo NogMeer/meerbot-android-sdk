@@ -91,8 +91,8 @@ class ChatControllerTest {
     )
 
     /** Догон истории. Режим диалога приходит именно отсюда. */
-    private fun history(mode: String = "ai", messages: String = "") = MockResponse().setBody(
-        """{"messages":[$messages],"hasMore":false,"mode":"$mode"}"""
+    private fun history(mode: String = "ai", messages: String = "", hasMore: Boolean = false) = MockResponse().setBody(
+        """{"messages":[$messages],"hasMore":$hasMore,"mode":"$mode"}"""
     )
 
     private fun sse(body: String) = MockResponse()
@@ -115,9 +115,10 @@ class ChatControllerTest {
         mode: String = "ai",
         messages: String = "",
         client: ApiClient = apiClient(),
+        hasMore: Boolean = false,
     ): ChatController {
         server.enqueue(register())
-        server.enqueue(history(mode = mode, messages = messages))
+        server.enqueue(history(mode = mode, messages = messages, hasMore = hasMore))
         val controller = controller(client)
         controller.start()
         await(controller) { it.ready }
@@ -139,6 +140,65 @@ class ChatControllerTest {
         assertEquals("мы на связи", controller.state.value.messages.single().content)
         assertEquals("/api/v1/mobile/register", server.takeRequest().path)
         assertTrue(server.takeRequest().path!!.startsWith("/api/v1/mobile/messages"))
+    }
+
+    private fun row(id: Long, content: String = "m$id") =
+        """{"id":$id,"role":"assistant","content":"$content","authorKind":"ai","createdAt":"2026-08-14T10:00:00.000Z"}"""
+
+    @Test
+    fun `старт грузит только хвост из трёх сообщений и запоминает что выше есть старее`() {
+        val controller = started(messages = listOf(row(8), row(9), row(10)).joinToString(","), hasMore = true)
+
+        assertTrue(controller.state.value.hasOlder)
+        server.takeRequest()
+        val path = server.takeRequest().path!!
+        assertTrue(path.contains("limit=${ChatController.INITIAL_HISTORY_LIMIT}"))
+        assertTrue(!path.contains("since") && !path.contains("before"))
+    }
+
+    @Test
+    fun `подгрузка старых ставит страницу над лентой и не трогает курсор догона`() {
+        val controller = started(messages = listOf(row(8), row(9), row(10)).joinToString(","), hasMore = true)
+        server.enqueue(history(messages = listOf(row(6), row(7)).joinToString(","), hasMore = false))
+
+        controller.loadOlder()
+        await(controller) { !it.loadingOlder && it.messages.size == 5 }
+
+        val state = controller.state.value
+        assertEquals(listOf(6L, 7L, 8L, 9L, 10L), state.messages.map { it.serverId })
+        assertEquals(10L, state.lastServerMessageId)
+        assertTrue(!state.hasOlder)
+        server.takeRequest()
+        server.takeRequest()
+        val path = server.takeRequest().path!!
+        assertTrue(path.contains("before=8"))
+        assertTrue(path.contains("limit=${ChatController.OLDER_PAGE_LIMIT}"))
+    }
+
+    @Test
+    fun `ошибка подгрузки старых видна экрану и не трогает ленту`() {
+        val controller = started(messages = listOf(row(8), row(9), row(10)).joinToString(","), hasMore = true)
+        server.enqueue(MockResponse().setResponseCode(500).setBody("{}"))
+
+        controller.loadOlder()
+        await(controller) { it.olderFailed }
+
+        val state = controller.state.value
+        assertTrue(!state.loadingOlder)
+        assertTrue(state.hasOlder)
+        assertEquals(listOf(8L, 9L, 10L), state.messages.map { it.serverId })
+    }
+
+    @Test
+    fun `без старых сообщений подгрузка в сеть не ходит`() {
+        val controller = started(messages = row(8), hasMore = false)
+
+        // Отказ синхронный: запрос не запускается вовсе (поллинг живёт в той же области,
+        // поэтому «дождаться простоя» здесь нечем — проверяем сразу после вызова).
+        controller.loadOlder()
+
+        assertTrue(!controller.state.value.loadingOlder)
+        assertEquals(2, server.requestCount)
     }
 
     @Test
@@ -1014,8 +1074,8 @@ class ChatControllerCatchUpTest {
         """{"deviceId":"42","jwt":"jwt-1","expiresIn":900,"attestationRequired":false,"identity":{"status":"not_provided"}}"""
     )
 
-    private fun history(mode: String = "ai", messages: String = "") = MockResponse().setBody(
-        """{"messages":[$messages],"hasMore":false,"mode":"$mode"}"""
+    private fun history(mode: String = "ai", messages: String = "", hasMore: Boolean = false) = MockResponse().setBody(
+        """{"messages":[$messages],"hasMore":$hasMore,"mode":"$mode"}"""
     )
 
     private fun managerMessage(id: Int, text: String) =

@@ -77,6 +77,12 @@ data class ChatState(
     val retryable: String? = null,
     /** Наибольший серверный id в ленте — курсор догона (`GET /mobile/messages?since=`). */
     val lastServerMessageId: Long = 0L,
+    /** Выше загруженного есть более старые сообщения — экран подгружает их прокруткой вверх. */
+    val hasOlder: Boolean = false,
+    /** Идёт подгрузка более старых сообщений. */
+    val loadingOlder: Boolean = false,
+    /** Последняя подгрузка старых упала — экран показывает «Повторить», автоповтора нет. */
+    val olderFailed: Boolean = false,
 )
 
 class ChatStore {
@@ -105,6 +111,15 @@ class ChatStore {
     fun setReady(value: Boolean) = _state.update { it.copy(ready = value) }
 
     fun setRetryable(text: String?) = _state.update { it.copy(retryable = text) }
+
+    fun setHasOlder(value: Boolean) = _state.update { it.copy(hasOlder = value) }
+
+    fun setLoadingOlder(loading: Boolean, failed: Boolean = false) =
+        _state.update { it.copy(loadingOlder = loading, olderFailed = failed) }
+
+    /** Самый старый серверный id в ленте — курсор `before` для подгрузки старых. */
+    val oldestServerMessageId: Long?
+        get() = _state.value.messages.mapNotNull { it.serverId }.minOrNull()
 
     /**
      * Курсор ленты на момент появления локальной строки: id → `lastServerMessageId` тогда. Записи
@@ -524,6 +539,10 @@ class ChatStore {
             current.copy(
                 messages = kept,
                 lastServerMessageId = 0L,
+                // Старые страницы считались от треда прежнего устройства — заново их скажет хвост.
+                hasOlder = false,
+                loadingOlder = false,
+                olderFailed = false,
                 retryable = current.retryable?.let { kept.lastOrNull { m -> m.failed && m.role == "user" }?.content },
             )
         }

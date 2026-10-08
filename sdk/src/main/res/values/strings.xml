@@ -51,4 +51,6 @@
     <string name="meerbot_attachment_file">Файл: %1$s</string>
     <string name="meerbot_attachment_download_failed">Не удалось скачать файл. Попробуйте ещё раз.</string>
     <string name="meerbot_attachment_no_viewer">Нет приложения для открытия этого файла.</string>
+    <string name="meerbot_loading_older">Загружаем предыдущие сообщения…</string>
+    <string name="meerbot_older_failed">Не удалось загрузить предыдущие сообщения</string>
 </resources>
